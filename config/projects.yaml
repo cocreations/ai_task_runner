@@ -1,0 +1,9 @@
+projects:
+  moment:
+    directory: /home/deploy/apps/moment
+    description: "Moment Events — sales pipeline, demo builder"
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: /home/deploy/apps/moment/credentials/live-service-account.json
+    allowed_users:
+      - kris
+      - michael

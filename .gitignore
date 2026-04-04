@@ -1,0 +1,6 @@
+.env
+.remote.yaml
+tasks/
+logs/
+__pycache__/
+*.pyc

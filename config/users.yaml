@@ -1,0 +1,7 @@
+users:
+  kris:
+    display_name: "Kris Randall"
+    api_key: "ctr_CHANGE_ME_kris_placeholder"
+  michael:
+    display_name: "Michael Pascoe"
+    api_key: "ctr_CHANGE_ME_michael_placeholder"

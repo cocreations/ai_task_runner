@@ -1,0 +1,3 @@
+{$DOMAIN} {
+    reverse_proxy task-runner:8080
+}

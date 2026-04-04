@@ -1,0 +1,30 @@
+services:
+  task-runner:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./tasks:/app/tasks
+      - ./logs:/app/logs
+      - claude_credentials:/root/.claude
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - task-runner
+
+volumes:
+  caddy_data:
+  caddy_config:
+  claude_credentials:
