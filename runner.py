@@ -2,14 +2,14 @@
 """
 Claude Task Runner — Task Processor
 
-Called by cron every minute. Scans the queue, claims the oldest task via
+Called every 5 seconds by the entrypoint loop. Scans the queue, claims the oldest task via
 atomic rename, and executes it via headless Claude Code CLI (claude -p).
 
 Concurrency: multiple runner processes can coexist safely. Atomic os.rename()
 prevents double-claiming. MAX_CONCURRENT limits how many tasks run at once.
 
 Usage:
-    python runner.py                    # Process one task (normal cron mode)
+    python runner.py                    # Process one task (called by entrypoint loop)
     MAX_CONCURRENT=4 python runner.py   # Override concurrency limit
 """
 
