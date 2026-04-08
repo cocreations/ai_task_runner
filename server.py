@@ -3,22 +3,31 @@ Claude Task Runner — MCP Server
 
 Accepts tasks via MCP tools, queues them as markdown files for execution
 by headless Claude Code CLI sessions. Authenticates users via API keys
-mapped to identities in config/users.yaml.
+mapped to identities in config/users.yaml, with OAuth 2.0 for claude.ai connectors.
 """
 
 import os
 import secrets
 import string
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import frontmatter
 import yaml
-from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.auth.provider import AccessToken, TokenVerifier
-from mcp.server.auth.settings import AuthSettings
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.auth.provider import (
+    SetupToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    OAuthClientInformationFull,
+    OAuthToken,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.server.fastmcp import FastMCP
 
 # ── Configuration ──
 
@@ -61,22 +70,148 @@ _user_keys = load_users()
 _projects = load_projects()
 
 
-class ApiKeyVerifier(TokenVerifier):
-    """Verifies pre-shared API keys from config/users.yaml."""
+class TaskRunnerOAuthProvider(OAuthAuthorizationServerProvider):
+    """
+    Minimal OAuth provider for claude.ai MCP connector integration.
 
-    async def verify_token(self, token: str) -> Optional[AccessToken]:
-        user = _user_keys.get(token)
-        if user is None:
-            return None
-        return AccessToken(
-            token=token,
-            client_id=user["name"],
+    Flow:
+    1. Claude.ai registers as a client (dynamic registration)
+    2. Claude.ai redirects user to /authorize
+    3. Server shows "enter your API key" page
+    4. User enters key, server validates, generates auth code
+    5. Claude.ai exchanges code for access token at /token
+    6. Setup token = the user's API key (permanent, no refresh needed)
+    """
+
+    def __init__(self):
+        self._clients: dict[str, OAuthClientInformationFull] = {}
+        self._auth_codes: dict[str, AuthorizationCode] = {}
+        # Map auth codes to the validated API key
+        self._code_to_api_key: dict[str, str] = {}
+        # Track issued access tokens
+        self._access_tokens: dict[str, SetupToken] = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self._clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self._clients[client_info.client_id] = client_info
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        """Return a URL for the API key entry page."""
+        # Store the auth params so we can complete the flow later
+        # Generate a session token for the auth page
+        session = secrets.token_urlsafe(32)
+
+        server_url = os.environ.get("SERVER_URL", "https://localhost:8080")
+        # Build URL to our auth page with all needed params
+        auth_url = (
+            f"{server_url}/auth-page"
+            f"?session={session}"
+            f"&client_id={client.client_id}"
+            f"&redirect_uri={params.redirect_uri}"
+            f"&code_challenge={params.code_challenge}"
+        )
+        if params.state:
+            auth_url += f"&state={params.state}"
+
+        return auth_url
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        code = self._auth_codes.get(authorization_code)
+        if code and code.client_id == client.client_id:
+            return code
+        return None
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        api_key = self._code_to_api_key.pop(authorization_code.code, None)
+        if not api_key:
+            from mcp.server.auth.provider import TokenError, TokenErrorCode
+            raise TokenError(error=TokenErrorCode.INVALID_GRANT, error_description="Invalid auth code")
+
+        # Clean up the auth code
+        self._auth_codes.pop(authorization_code.code, None)
+
+        # Store the access token for later verification
+        user = _user_keys.get(api_key)
+        self._access_tokens[api_key] = SetupToken(
+            token=api_key,
+            client_id=user["name"] if user else "unknown",
             scopes=[],
         )
+
+        return OAuthToken(
+            access_token=api_key,
+            token_type="Bearer",
+            expires_in=31536000,  # 1 year
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        return None  # We don't use refresh tokens
+
+    async def exchange_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
+    ) -> OAuthToken:
+        from mcp.server.auth.provider import TokenError, TokenErrorCode
+        raise TokenError(error=TokenErrorCode.INVALID_GRANT, error_description="Refresh not supported")
+
+    async def load_access_token(self, token: str) -> SetupToken | None:
+        # Check if it's a valid API key
+        user = _user_keys.get(token)
+        if user:
+            return SetupToken(
+                token=token,
+                client_id=user["name"],
+                scopes=[],
+            )
+        return self._access_tokens.get(token)
+
+    async def revoke_token(self, token) -> None:
+        if hasattr(token, 'token'):
+            self._access_tokens.pop(token.token, None)
+
+    def complete_authorization(
+        self, api_key: str, client_id: str, redirect_uri: str,
+        code_challenge: str, state: str | None
+    ) -> str | None:
+        """Validate API key and generate auth code. Returns redirect URL or None."""
+        user = _user_keys.get(api_key)
+        if not user:
+            return None
+
+        code = secrets.token_urlsafe(32)
+        self._auth_codes[code] = AuthorizationCode(
+            code=code,
+            scopes=[],
+            expires_at=time.time() + 300,  # 5 min
+            client_id=client_id,
+            code_challenge=code_challenge,
+            redirect_uri=redirect_uri,
+            redirect_uri_provided_explicitly=True,
+        )
+        self._code_to_api_key[code] = api_key
+
+        # Write marker so the platform knows MCP has been connected
+        marker = CONFIG_DIR / ".mcp_connected"
+        marker.write_text(datetime.now(timezone.utc).isoformat())
+
+        return construct_redirect_uri(redirect_uri, code=code, state=state)
+
+
+oauth_provider = TaskRunnerOAuthProvider()
 
 
 def get_current_user() -> str:
     """Get the authenticated username from the current request context."""
+    from mcp.server.auth.middleware.auth_context import get_access_token
     token = get_access_token()
     if token is None:
         raise ValueError("No authenticated user")
@@ -133,27 +268,126 @@ def list_task_files(status: str = "", limit: int = 20) -> list[Path]:
 
 _server_url = os.environ.get("SERVER_URL", "https://localhost:8080")
 
-verifier = ApiKeyVerifier()
-
 mcp = FastMCP(
     "claude-task-runner",
     instructions="""You are connected to a Claude Task Runner — a system that queues prompts
 for headless Claude Code execution on a remote server.
 
-Use submit_task to queue work. The task will be picked up within 1 minute
+Use submit_task to queue work. The task will be picked up within seconds
 and executed by Claude Code with full access to the specified project.
 
 Use task_status or list_tasks to check progress. Use task_output to see
 results once complete.""",
-    token_verifier=verifier,
+    auth_server_provider=oauth_provider,
     auth=AuthSettings(
         issuer_url=_server_url,
         resource_server_url=_server_url,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+        ),
     ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8080)),
     streamable_http_path="/",
 )
+
+
+# ── Auth page route ──
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse
+
+
+AUTH_PAGE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Connect to AI Task Runner</title>
+    <style>
+        body {{ font-family: system-ui, sans-serif; background: #0f0d1a; color: #e8e6f0;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+        .card {{ background: #1a1730; border: 1px solid rgba(255,255,255,0.12); border-radius: 16px;
+                 padding: 2rem; max-width: 420px; width: 100%; }}
+        h2 {{ color: #fff; margin-top: 0; }}
+        p {{ color: #a09bb5; font-size: 0.9rem; line-height: 1.5; }}
+        input {{ width: 100%; padding: 0.6rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
+                 background: #0f0d1a; color: #e8e6f0; font-size: 1rem; box-sizing: border-box; }}
+        button {{ width: 100%; padding: 0.7rem; border-radius: 8px; border: none; background: #818cf8;
+                  color: #fff; font-size: 1rem; cursor: pointer; margin-top: 1rem; }}
+        button:hover {{ background: #6366f1; }}
+        .error {{ color: #fca5a5; font-size: 0.85rem; margin-top: 0.5rem; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>Connect to AI Task Runner</h2>
+        <p>Enter your API key to authorize claude.ai to access your task runner.
+           You can find this on your <strong>Setup</strong> page at ai-task-runner.com.</p>
+        {error}
+        <form method="post">
+            <input type="hidden" name="client_id" value="{client_id}">
+            <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+            <input type="hidden" name="code_challenge" value="{code_challenge}">
+            <input type="hidden" name="state" value="{state}">
+            <label style="display:block; margin-bottom: 0.5rem; color: #a09bb5; font-size: 0.85rem;">API Key</label>
+            <input type="password" name="api_key" placeholder="Your API key from the Setup page" required autofocus>
+            <button type="submit">Authorize</button>
+        </form>
+    </div>
+</body>
+</html>"""
+
+
+async def auth_page_get(request: Request) -> HTMLResponse:
+    """Show the API key entry form."""
+    params = request.query_params
+    return HTMLResponse(AUTH_PAGE_HTML.format(
+        client_id=params.get("client_id", ""),
+        redirect_uri=params.get("redirect_uri", ""),
+        code_challenge=params.get("code_challenge", ""),
+        state=params.get("state", ""),
+        error="",
+    ))
+
+
+async def auth_page_post(request: Request) -> HTMLResponse | RedirectResponse:
+    """Handle API key submission."""
+    form = await request.form()
+    api_key = form.get("api_key", "").strip()
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    code_challenge = form.get("code_challenge", "")
+    state = form.get("state", "") or None
+
+    redirect_url = oauth_provider.complete_authorization(
+        api_key=api_key,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        state=state,
+    )
+
+    if not redirect_url:
+        return HTMLResponse(AUTH_PAGE_HTML.format(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            state=state or "",
+            error='<p class="error">Invalid API key. Check your Setup page at ai-task-runner.com.</p>',
+        ))
+
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+@mcp.custom_route("/auth-page", methods=["GET"])
+async def auth_page_get_route(request: Request) -> HTMLResponse:
+    return await auth_page_get(request)
+
+
+@mcp.custom_route("/auth-page", methods=["POST"])
+async def auth_page_post_route(request: Request):
+    return await auth_page_post(request)
 
 
 # ── Tools ──
@@ -163,7 +397,7 @@ results once complete.""",
 def submit_task(project: str, prompt: str, max_timeout_minutes: int = 60) -> str:
     """Submit a task for headless Claude Code execution.
 
-    The task will be queued and picked up within 1 minute by the runner.
+    The task will be queued and picked up within seconds by the runner.
 
     Args:
         project: Project name (from projects.yaml) — determines working directory.
@@ -204,7 +438,7 @@ def submit_task(project: str, prompt: str, max_timeout_minutes: int = 60) -> str
     with open(task_path, "wb") as f:
         frontmatter.dump(post, f)
 
-    return f"Task queued: {task_id}\nProject: {project}\nTimeout: {max_timeout_minutes}m\nIt will be picked up within 1 minute."
+    return f"Task queued: {task_id}\nProject: {project}\nTimeout: {max_timeout_minutes}m\nIt will be picked up within seconds."
 
 
 @mcp.tool()

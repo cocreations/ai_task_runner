@@ -13,6 +13,7 @@ Usage:
     MAX_CONCURRENT=4 python runner.py   # Override concurrency limit
 """
 
+import json as json_mod
 import os
 import subprocess
 import sys
@@ -34,6 +35,20 @@ FAILED_DIR = TASKS_DIR / "failed"
 
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2))
 DEFAULT_TIMEOUT_MINUTES = int(os.environ.get("DEFAULT_TIMEOUT_MINUTES", 60))
+
+SYSTEM_CONTEXT_TEMPLATE = """\
+## System Context
+You are running inside an isolated Docker container on the AI Task Runner platform.
+- You are the `taskrunner` user (non-root).
+- Your workspace is `/workspace`. All project files are here.
+- Current project: `{project_name}` (directory: `/workspace/{project_name}`)
+- Your username: `{username}`
+- You have no access to host services (Caddy, Docker, DNS, etc).
+- You cannot modify infrastructure outside this container.
+- Static websites are served automatically: put files in your project directory and they are live at `https://{project_name}.{username}.{domain}`
+- Installed skills may provide additional context about what you can do.
+- Focus on the task using the tools and files available within your workspace.
+"""
 
 
 def log(msg: str):
@@ -96,7 +111,21 @@ def update_frontmatter(path: Path, **updates) -> frontmatter.Post:
     return post
 
 
-def finalize_task(task_path: Path, status: str, exit_code: int | None = None):
+def extract_result_summary(log_path: Path) -> str:
+    """Extract the result text from a Claude JSON log."""
+    try:
+        content = log_path.read_text()
+        data = json_mod.loads(content)
+        result = data.get("result", "")
+        if len(result) > 500:
+            result = result[:500] + "..."
+        return result
+    except Exception:
+        return ""
+
+
+def finalize_task(task_path: Path, status: str, exit_code: int | None = None,
+                  result_summary: str = ""):
     """Move a task to its final directory and update metadata."""
     now = datetime.now(timezone.utc).isoformat()
 
@@ -106,10 +135,27 @@ def finalize_task(task_path: Path, status: str, exit_code: int | None = None):
     updates = {"status": status, "completed_at": now}
     if exit_code is not None:
         updates["exit_code"] = exit_code
+    if result_summary:
+        updates["result_summary"] = result_summary
     update_frontmatter(task_path, **updates)
 
     os.rename(task_path, dest)
     log(f"Task {task_path.stem} → {status} (exit_code={exit_code})")
+
+
+def load_skills(project_dir: str) -> str:
+    """Load all installed SKILL.md files and return as prompt context."""
+    skills_dir = Path(project_dir).parent / ".skills"
+    if not skills_dir.is_dir():
+        return ""
+    parts = []
+    for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+        content = skill_file.read_text().strip()
+        if content:
+            parts.append(content)
+    if not parts:
+        return ""
+    return "\n## Installed Skills\n\n" + "\n\n---\n\n".join(parts) + "\n"
 
 
 def run_task(task_path: Path, projects: dict, users: dict):
@@ -119,7 +165,7 @@ def run_task(task_path: Path, projects: dict, users: dict):
     task_id = meta.get("id", task_path.stem)
     project_name = meta.get("project", "")
     username = meta.get("user", "")
-    prompt = post.content.strip()
+    task_prompt = post.content.strip()
     timeout_minutes = meta.get("max_timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
 
     log(f"Processing task {task_id}: project={project_name}, user={username}, timeout={timeout_minutes}m")
@@ -145,12 +191,44 @@ def run_task(task_path: Path, projects: dict, users: dict):
         finalize_task(task_path, "failed", exit_code=1)
         return
 
+    # Check disk usage against limit
+    workspace_dir = Path(project_dir).parent
+    try:
+        result = subprocess.run(["du", "-sm", str(workspace_dir)],
+                                capture_output=True, text=True, timeout=10)
+        usage_mb = float(result.stdout.split()[0]) if result.returncode == 0 else 0
+    except Exception:
+        usage_mb = 0
+    limit_mb = int(os.environ.get("DISK_LIMIT_MB", "1024"))
+    if usage_mb > limit_mb:
+        log(f"Task {task_id}: disk limit exceeded ({usage_mb:.0f} MB / {limit_mb} MB)")
+        finalize_task(task_path, "failed", exit_code=1,
+                      result_summary=f"Disk limit exceeded ({usage_mb:.0f} MB / {limit_mb} MB). "
+                                     f"Purchase additional storage in your dashboard at ai-task-runner.com.")
+        return
+
+    # Build full prompt: system context + skills + user task
+    server_url = os.environ.get("SERVER_URL", "")
+    domain = server_url.replace("https://", "").split("/")[0] if server_url else "ai-task-runner.com"
+    # domain is "username.ai-task-runner.com", we want just "ai-task-runner.com"
+    domain_parts = domain.split(".", 1)
+    base_domain = domain_parts[1] if len(domain_parts) > 1 else domain
+
+    system_context = SYSTEM_CONTEXT_TEMPLATE.format(
+        project_name=project_name,
+        username=username,
+        domain=base_domain,
+    )
+    skills_context = load_skills(project_dir)
+    prompt = system_context + skills_context + "\n## Task\n" + task_prompt
+
     # Mark as processing
     now = datetime.now(timezone.utc).isoformat()
     update_frontmatter(task_path, status="processing", started_at=now)
 
-    # Build environment
+    # Build environment — run claude as non-root taskrunner user
     env = os.environ.copy()
+    env["HOME"] = "/home/taskrunner"
     for key, value in project.get("env", {}).items():
         env[key] = str(value)
 
@@ -158,26 +236,27 @@ def run_task(task_path: Path, projects: dict, users: dict):
     log_path = LOGS_DIR / f"{task_id}.log"
 
     # Launch Claude Code
-    # Pass prompt as positional arg to `claude -p`. For very long prompts
-    # (>128KB), pipe via stdin instead: ["claude", "-p"], input=prompt
     try:
         with open(log_path, "w") as log_file:
             result = subprocess.run(
-                ["claude", "-p", prompt, "--output-format", "json"],
+                ["claude", "-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"],
                 text=True,
                 timeout=timeout_minutes * 60,
                 cwd=project_dir,
                 env=env,
+                user="taskrunner",
+                group="taskrunner",
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
             )
         exit_code = result.returncode
         status = "done" if exit_code == 0 else "failed"
-        finalize_task(task_path, status, exit_code=exit_code)
+        result_summary = extract_result_summary(log_path)
+        finalize_task(task_path, status, exit_code=exit_code,
+                      result_summary=result_summary)
 
     except subprocess.TimeoutExpired:
         log(f"Task {task_id}: timed out after {timeout_minutes}m")
-        # Write timeout notice to log
         with open(log_path, "a") as f:
             f.write(f"\n\n--- TIMEOUT ---\nTask killed after {timeout_minutes} minutes.\n")
         finalize_task(task_path, "timeout", exit_code=-1)

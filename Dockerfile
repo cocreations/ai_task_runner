@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# Install system deps: cron, curl, Node.js 22
+# Install system deps: curl, Node.js 22
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cron curl ca-certificates gnupg \
+    curl ca-certificates gnupg \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
+
+# Create non-root user for running Claude Code (--dangerously-skip-permissions requires non-root)
+RUN useradd -m -s /bin/bash taskrunner
 
 WORKDIR /app
 
