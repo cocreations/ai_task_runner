@@ -163,14 +163,40 @@ def update_frontmatter(path: Path, **updates) -> frontmatter.Post:
 
 
 def extract_result_summary(log_path: Path) -> str:
-    """Extract the result text from a Claude JSON log."""
+    """Extract the result text from a Claude log.
+
+    Logs are NDJSON (one event per line) when produced with
+    ``--output-format stream-json``. Walk from the end to find the last
+    ``{"type":"result",...}`` event and return its ``result`` field.
+
+    Falls back to parsing the whole file as a single JSON object, to stay
+    compatible with logs produced under the previous ``--output-format json``
+    setting (useful mid-migration and for any manual tooling).
+    """
     try:
         content = log_path.read_text()
+    except Exception:
+        return ""
+
+    def _truncate(s: str) -> str:
+        return s[:500] + "..." if len(s) > 500 else s
+
+    # NDJSON path: last result event wins.
+    for line in reversed(content.splitlines()):
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json_mod.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") == "result":
+            return _truncate(obj.get("result", "") or "")
+
+    # Legacy single-JSON fallback.
+    try:
         data = json_mod.loads(content)
-        result = data.get("result", "")
-        if len(result) > 500:
-            result = result[:500] + "..."
-        return result
+        return _truncate(data.get("result", "") or "")
     except Exception:
         return ""
 
@@ -430,11 +456,14 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # use --resume to pick up where we left off.
     session_flag = "--resume" if session_started else "--session-id"
     claude_cmd = ["claude", session_flag, claude_session_id, "-p", prompt,
-                  "--output-format", "json", "--dangerously-skip-permissions"]
+                  "--output-format", "stream-json", "--verbose",
+                  "--dangerously-skip-permissions"]
 
-    # Launch Claude Code
+    # Launch Claude Code. Log file is line-buffered so each NDJSON event
+    # flushes to disk immediately — the platform's web dashboard tails this
+    # file to show live WIP output.
     try:
-        with open(log_path, "w") as log_file:
+        with open(log_path, "w", buffering=1) as log_file:
             result = subprocess.run(
                 claude_cmd,
                 text=True,
