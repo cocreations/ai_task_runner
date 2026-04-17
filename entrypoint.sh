@@ -9,8 +9,10 @@ chown -R taskrunner:taskrunner /workspace /app/tasks /app/logs
 chmod -R 775 /workspace /app/tasks /app/logs
 
 # Start task runner loop in background (polls every 5 seconds)
+# Each invocation runs in background (&) so long-running tasks don't block the loop.
+# Concurrency is controlled by MAX_CONCURRENT check inside runner.py.
 (while true; do
-    cd /app && python /app/runner.py >> /app/logs/runner.log 2>&1 || true
+    cd /app && python /app/runner.py >> /app/logs/runner.log 2>&1 &
     sleep 5
 done) &
 

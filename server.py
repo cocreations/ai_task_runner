@@ -17,7 +17,7 @@ from typing import Optional
 import frontmatter
 import yaml
 from mcp.server.auth.provider import (
-    SetupToken,
+    AccessToken,
     AuthorizationCode,
     AuthorizationParams,
     OAuthAuthorizationServerProvider,
@@ -89,7 +89,7 @@ class TaskRunnerOAuthProvider(OAuthAuthorizationServerProvider):
         # Map auth codes to the validated API key
         self._code_to_api_key: dict[str, str] = {}
         # Track issued access tokens
-        self._access_tokens: dict[str, SetupToken] = {}
+        self._access_tokens: dict[str, AccessToken] = {}
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self._clients.get(client_id)
@@ -140,7 +140,7 @@ class TaskRunnerOAuthProvider(OAuthAuthorizationServerProvider):
 
         # Store the access token for later verification
         user = _user_keys.get(api_key)
-        self._access_tokens[api_key] = SetupToken(
+        self._access_tokens[api_key] = AccessToken(
             token=api_key,
             client_id=user["name"] if user else "unknown",
             scopes=[],
@@ -163,11 +163,11 @@ class TaskRunnerOAuthProvider(OAuthAuthorizationServerProvider):
         from mcp.server.auth.provider import TokenError, TokenErrorCode
         raise TokenError(error=TokenErrorCode.INVALID_GRANT, error_description="Refresh not supported")
 
-    async def load_access_token(self, token: str) -> SetupToken | None:
+    async def load_access_token(self, token: str) -> AccessToken | None:
         # Check if it's a valid API key
         user = _user_keys.get(token)
         if user:
-            return SetupToken(
+            return AccessToken(
                 token=token,
                 client_id=user["name"],
                 scopes=[],
@@ -200,7 +200,7 @@ class TaskRunnerOAuthProvider(OAuthAuthorizationServerProvider):
         self._code_to_api_key[code] = api_key
 
         # Write marker so the platform knows MCP has been connected
-        marker = CONFIG_DIR / ".mcp_connected"
+        marker = TASKS_DIR / ".mcp_connected"
         marker.write_text(datetime.now(timezone.utc).isoformat())
 
         return construct_redirect_uri(redirect_uri, code=code, state=state)
@@ -394,7 +394,7 @@ async def auth_page_post_route(request: Request):
 
 
 @mcp.tool()
-def submit_task(project: str, prompt: str, max_timeout_minutes: int = 60) -> str:
+def submit_task(project: str, prompt: str, max_timeout_minutes: int = 120) -> str:
     """Submit a task for headless Claude Code execution.
 
     The task will be queued and picked up within seconds by the runner.
@@ -402,7 +402,7 @@ def submit_task(project: str, prompt: str, max_timeout_minutes: int = 60) -> str
     Args:
         project: Project name (from projects.yaml) — determines working directory.
         prompt: The prompt/instructions for Claude Code to execute.
-        max_timeout_minutes: Maximum execution time (default 60, max 180).
+        max_timeout_minutes: Maximum execution time (default 120, max 180).
     """
     username = get_current_user()
 
