@@ -7,6 +7,8 @@ services:
       - ./config:/app/config:ro
       - ./tasks:/app/tasks
       - ./logs:/app/logs
+      - ./artifacts:/app/artifacts
+      - ./secrets:/secrets:ro
       - claude_credentials:/root/.claude
     expose:
       - "8080"
@@ -19,6 +21,7 @@ services:
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./artifacts:/srv/artifacts:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

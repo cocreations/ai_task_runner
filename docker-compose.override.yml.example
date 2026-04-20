@@ -1,0 +1,18 @@
+# Copy this to docker-compose.override.yml and edit the bind mounts to match
+# your VPS layout. Docker Compose merges this with docker-compose.yml at start.
+#
+# The task-runner container reads project files from paths declared in
+# config/projects.yaml (e.g. /home/deploy/apps/moment). Those host paths need
+# to be mounted into the container at the same path so `runner.py`'s `cd`
+# into the project dir succeeds, and so the skills-loader at
+# `{project_dir}/../.skills/` finds SKILL.md files.
+
+services:
+  task-runner:
+    volumes:
+      # Project directories — one line per project in projects.yaml:
+      - /home/deploy/apps/moment:/home/deploy/apps/moment
+      - /home/deploy/apps/lor-elementals:/home/deploy/apps/lor-elementals
+
+      # Skills directory (sibling of the project dirs):
+      - /home/deploy/apps/.skills:/home/deploy/apps/.skills:ro

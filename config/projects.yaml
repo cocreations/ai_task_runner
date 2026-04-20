@@ -7,3 +7,22 @@ projects:
     allowed_users:
       - kris
       - michael
+
+  lor:
+    # On the VPS, clone github.com/krisrandall/lor-elementals to this path and
+    # bind-mount it into the container (add to docker-compose.override.yml):
+    #   - /home/deploy/apps/lor-elementals:/home/deploy/apps/lor-elementals
+    directory: /home/deploy/apps/lor-elementals
+    description: "Legend of Rah: Elementals — Godot 4.5 Android game"
+    env:
+      # Fill these in before deploying. Do NOT commit real secrets here.
+      PIXELLAB_API_KEY: "REPLACE_ME"
+      LOR_KEYSTORE_PATH: /secrets/lor.keystore
+      LOR_KEYSTORE_PASSWORD: "REPLACE_ME"
+      LOR_KEY_ALIAS: lor
+      LOR_KEY_PASSWORD: "REPLACE_ME"
+      # Public URL base served by Caddy's /artifacts/* handler:
+      ARTIFACT_BASE_URL: "https://REPLACE_WITH_DOMAIN/artifacts"
+      ARTIFACT_DIR: /app/artifacts
+    allowed_users:
+      - kris

@@ -1,3 +1,7 @@
 {$DOMAIN} {
+    handle_path /artifacts/* {
+        root * /srv/artifacts
+        file_server
+    }
     reverse_proxy task-runner:8080
 }
