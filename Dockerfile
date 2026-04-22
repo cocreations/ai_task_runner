@@ -84,21 +84,14 @@ RUN set -eux; \
         -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000; \
     chmod 644 /opt/godot/debug.keystore
 
+COPY godot-editor-settings-4.tres /tmp/editor_settings-4.tres
 RUN set -eux; \
     for HOME_DIR in /root /home/taskrunner; do \
         mkdir -p "${HOME_DIR}/.config/godot"; \
-        cat > "${HOME_DIR}/.config/godot/editor_settings-4.tres" <<EOF
-[gd_resource type="EditorSettings" format=3]
-
-[resource]
-export/android/android_sdk_path = "/opt/android-sdk"
-export/android/debug_keystore = "/opt/godot/debug.keystore"
-export/android/debug_keystore_user = "androiddebugkey"
-export/android/debug_keystore_pass = "android"
-export/java/java_sdk_path = "/usr/lib/jvm/java-17-openjdk-amd64"
-EOF
+        cp /tmp/editor_settings-4.tres "${HOME_DIR}/.config/godot/editor_settings-4.tres"; \
     done; \
-    chown -R taskrunner:taskrunner /home/taskrunner/.config
+    chown -R taskrunner:taskrunner /home/taskrunner/.config; \
+    rm /tmp/editor_settings-4.tres
 
 WORKDIR /app
 

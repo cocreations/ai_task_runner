@@ -1,0 +1,8 @@
+[gd_resource type="EditorSettings" format=3]
+
+[resource]
+export/android/android_sdk_path = "/opt/android-sdk"
+export/android/debug_keystore = "/opt/godot/debug.keystore"
+export/android/debug_keystore_user = "androiddebugkey"
+export/android/debug_keystore_pass = "android"
+export/java/java_sdk_path = "/usr/lib/jvm/java-17-openjdk-amd64"
