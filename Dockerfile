@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 # ---------------------------------------------------------------------------
 # Base system deps: curl, git, Node.js 22, plus Godot/Android toolchain needs.
