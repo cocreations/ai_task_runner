@@ -40,7 +40,7 @@ RUN set -eux; \
 RUN set -eux; \
     curl -fsSL "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_export_templates.tpz" \
         -o /tmp/templates.tpz; \
-    TEMPLATES_VERSION="${GODOT_VERSION/-/.}"; \
+    TEMPLATES_VERSION="$(echo "${GODOT_VERSION}" | tr '-' '.')"; \
     mkdir -p "/root/.local/share/godot/export_templates/${TEMPLATES_VERSION}"; \
     mkdir -p "/home/taskrunner/.local/share/godot/export_templates/${TEMPLATES_VERSION}"; \
     unzip -q /tmp/templates.tpz -d /tmp/templates; \
