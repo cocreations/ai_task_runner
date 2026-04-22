@@ -106,6 +106,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# ---------------------------------------------------------------------------
+# Playwright + headless Chromium (for visual checks like moment-qa-gate's
+# landing-page screenshots). Browsers installed to a shared system path so
+# both root and taskrunner can use them. --with-deps pulls in the apt
+# system libraries Chromium needs (libglib-2.0, libnss3, libxkbcommon, etc.).
+# ---------------------------------------------------------------------------
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN pip install --no-cache-dir playwright \
+    && playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/playwright
+
 # Copy application code
 COPY server.py runner.py enqueue.py task_wait.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh
