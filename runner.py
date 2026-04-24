@@ -445,6 +445,11 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # Build environment — run claude as non-root taskrunner user
     env = os.environ.copy()
     env["HOME"] = "/home/taskrunner"
+    # Bridge submitter identity into the subprocess. getpass.getuser() returns
+    # "taskrunner" on the VPS; consumers that need the actual submitter (e.g.
+    # moment-agents stamping `owner` on prospects) read CLAUDE_USER.
+    if username:
+        env["CLAUDE_USER"] = username
     for key, value in project.get("env", {}).items():
         env[key] = str(value)
 
