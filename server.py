@@ -6,6 +6,7 @@ by headless Claude Code CLI sessions. Authenticates users via API keys
 mapped to identities in config/users.yaml, with OAuth 2.0 for claude.ai connectors.
 """
 
+import ipaddress
 import os
 import secrets
 import string
@@ -13,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import frontmatter
 import yaml
@@ -268,16 +270,50 @@ def list_task_files(status: str = "", limit: int = 20) -> list[Path]:
 
 _server_url = os.environ.get("SERVER_URL", "https://localhost:8080")
 
+
+def _build_identity() -> dict:
+    """Identify this server: URL, hostname, and deployment type.
+
+    Deployment is taken from the DEPLOYMENT env var if set; otherwise
+    auto-detected as 'local' for loopback / RFC1918 hosts, else 'self-hosted'.
+    The platform wrapper sets DEPLOYMENT=hosted explicitly.
+    """
+    hostname = urlparse(_server_url).hostname or "unknown"
+
+    deployment = os.environ.get("DEPLOYMENT", "").strip().lower()
+    if not deployment:
+        deployment = "self-hosted"
+        if hostname in ("localhost", "127.0.0.1", "::1"):
+            deployment = "local"
+        else:
+            try:
+                if ipaddress.ip_address(hostname).is_private:
+                    deployment = "local"
+            except ValueError:
+                pass
+
+    return {
+        "server_url": _server_url,
+        "hostname": hostname,
+        "deployment": deployment,
+    }
+
+
+_identity = _build_identity()
+
 mcp = FastMCP(
     "claude-task-runner",
-    instructions="""You are connected to a Claude Task Runner — a system that queues prompts
+    instructions=f"""You are connected to a Claude Task Runner — a system that queues prompts
 for headless Claude Code execution on a remote server.
 
 Use submit_task to queue work. The task will be picked up within seconds
 and executed by Claude Code with full access to the specified project.
 
 Use task_status or list_tasks to check progress. Use task_output to see
-results once complete.""",
+results once complete.
+
+This server identifies as: {_identity['hostname']} ({_identity['deployment']} deployment, URL: {_identity['server_url']}).
+Call the server_info tool any time to re-check this identity.""",
     auth_server_provider=oauth_provider,
     auth=AuthSettings(
         issuer_url=_server_url,
@@ -568,6 +604,23 @@ def task_output(task_id: str) -> str:
         content = "... (truncated, showing last 50000 chars) ...\n" + content[-50000:]
 
     return content
+
+
+@mcp.tool()
+def server_info() -> str:
+    """Identify which AI Task Runner MCP server you are connected to.
+
+    Returns the server's hostname, public URL, and deployment type
+    (hosted = ai-task-runner.com platform / self-hosted = user's own VPS / local = dev).
+    Useful when the user asks "which server am I on" or before a task that
+    depends on knowing the environment.
+    """
+    info = _build_identity()
+    return (
+        f"Server hostname: {info['hostname']}\n"
+        f"Server URL: {info['server_url']}\n"
+        f"Deployment: {info['deployment']}"
+    )
 
 
 @mcp.tool()
