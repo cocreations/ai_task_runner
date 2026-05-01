@@ -38,12 +38,15 @@ AWAITING_CREDITS_DIR = TASKS_DIR / "awaiting_credits"
 AWAITING_WEEKLY_RESET_DIR = TASKS_DIR / "awaiting_weekly_reset"
 
 # Pattern for Claude's credit-limit error, e.g.
+#   "You've hit your limit · resets 9:30pm (UTC)"     (kind absent — current format)
 #   "You've hit your session limit · resets 3:45pm"
 #   "You've hit your weekly limit · resets Mon 12:00am"
 #   "You've hit your Opus limit · resets 3:45pm"
 # The middot (·) and ascii dashes are both observed; we accept either.
+# Preferred path is the structured `rate_limit_event` JSON line; this regex
+# is the fallback when the structured event isn't in the log.
 CREDIT_LIMIT_RE = re.compile(
-    r"You['\u2019]ve hit your\s+(?P<kind>[A-Za-z]+)\s+limit\s*[\u00B7\-:]?\s*resets\s+(?P<reset>[^\n\r.]+)",
+    r"You['\u2019]ve hit your(?:\s+(?P<kind>[A-Za-z]+))?\s+limit\s*[\u00B7\-:]?\s*resets\s+(?P<reset>[^\n\r.]+)",
     re.IGNORECASE,
 )
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -201,20 +204,50 @@ def extract_result_summary(log_path: Path) -> str:
         return ""
 
 
-def detect_credit_limit(log_path: Path) -> tuple[bool, str, str] | tuple[bool, None, None]:
-    """Scan a task's log for Claude's credit-limit error message.
+def detect_credit_limit(log_path: Path):
+    """Scan a task's log for Claude's rate-limit signals.
 
-    Returns (hit, kind, reset_raw) where kind is lowercased (e.g. "session",
-    "weekly", "opus") and reset_raw is the trimmed string after "resets".
+    Returns (hit, kind, reset_raw, reset_dt). When `hit` is True, exactly one
+    of `reset_raw` (human string for parse_reset_time) or `reset_dt` (precise
+    UTC datetime from a structured rate_limit_event) will be set.
+
+    Preference order:
+      1. Structured stream-json `rate_limit_event` line (precise epoch).
+      2. Legacy human-readable "You've hit your … limit · resets …" string.
     """
     try:
         text = log_path.read_text(errors="replace")
     except Exception:
-        return False, None, None
+        return False, None, None, None
+
+    # 1. Structured event — emitted by claude --output-format=stream-json.
+    for line in text.splitlines():
+        if '"type":"rate_limit_event"' not in line and \
+                '"type": "rate_limit_event"' not in line:
+            continue
+        try:
+            obj = json_mod.loads(line)
+        except Exception:
+            continue
+        info = obj.get("rate_limit_info") or {}
+        if info.get("status") != "rejected":
+            continue
+        epoch = info.get("resetsAt")
+        kind = info.get("rateLimitType") or "session"
+        if epoch:
+            try:
+                reset_dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+            except Exception:
+                continue
+            return True, str(kind).lower(), None, reset_dt
+
+    # 2. Fall back to the human-readable error string.
     m = CREDIT_LIMIT_RE.search(text)
     if not m:
-        return False, None, None
-    return True, m.group("kind").lower(), m.group("reset").strip()
+        return False, None, None, None
+    raw_kind = m.group("kind")
+    kind = raw_kind.lower() if raw_kind else "session"
+    return True, kind, m.group("reset").strip(), None
 
 
 def parse_reset_time(reset_raw: str, now_utc: datetime) -> datetime | None:
@@ -225,6 +258,8 @@ def parse_reset_time(reset_raw: str, now_utc: datetime) -> datetime | None:
     occurrence; for weekday-prefixed strings, the next matching weekday.
     """
     s = reset_raw.strip()
+    # Drop trailing parenthesised qualifiers like "(UTC)".
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
     if not s:
         return None
 
@@ -485,13 +520,15 @@ def run_task(task_path: Path, projects: dict, users: dict):
         # Before calling the run a success or failure, check for Claude
         # credit-limit error. If hit, park the task in awaiting_*.
         if exit_code != 0:
-            hit, kind, reset_raw = detect_credit_limit(log_path)
+            hit, kind, reset_raw, reset_dt = detect_credit_limit(log_path)
             if hit:
                 now_utc = datetime.now(timezone.utc)
-                reset_dt = parse_reset_time(reset_raw, now_utc)
+                if reset_dt is None:
+                    reset_dt = parse_reset_time(reset_raw or "", now_utc)
                 if reset_dt is None:
                     reset_dt = now_utc + timedelta(hours=FALLBACK_WAIT_HOURS)
-                finalize_awaiting(task_path, kind, reset_dt, reset_raw, exit_code)
+                finalize_awaiting(task_path, kind, reset_dt,
+                                  reset_raw or reset_dt.isoformat(), exit_code)
                 return
 
             # If this was a --resume attempt and it looks like the session is
