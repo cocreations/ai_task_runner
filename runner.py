@@ -350,6 +350,28 @@ def requeue_ready_awaiting_tasks():
                 log(f"Error re-queueing {task_file.name}: {e}")
 
 
+MODEL_DIRECTIVE_RE = re.compile(r"^\s*/model\s+\S+", re.MULTILINE)
+
+
+def has_model_override(task_prompt: str) -> bool:
+    """True if the task prompt's first ~10 lines contain a /model slash command.
+    Matches the line-anchored pattern Claude CLI uses for slash commands, so
+    detection == what Claude actually treats as a directive."""
+    head = "\n".join(task_prompt.splitlines()[:10])
+    return MODEL_DIRECTIVE_RE.search(head) is not None
+
+
+def read_default_model() -> str | None:
+    """Read the user's saved default model from config/.default_model, or None."""
+    path = CONFIG_DIR / ".default_model"
+    if not path.exists():
+        return None
+    try:
+        return path.read_text().strip() or None
+    except Exception:
+        return None
+
+
 def earliest_pending_credit_hold() -> datetime | None:
     """Return the earliest future credit_reset_at across all parked tasks,
     or None if no task is currently in a credit hold. Call after
@@ -498,6 +520,15 @@ def run_task(task_path: Path, projects: dict, users: dict):
         domain=base_domain,
     )
     skills_context = load_skills(project_dir)
+
+    # Apply the user's default-model preference to the task prompt unless the
+    # task already specifies its own /model directive. Injecting into
+    # task_prompt (not the assembled prompt) keeps the convention identical
+    # to a user-written /model line at the top of their task.
+    default_model = read_default_model()
+    if default_model and not has_model_override(task_prompt):
+        task_prompt = f"/model {default_model};\n\n" + task_prompt
+
     prompt = system_context + skills_context + "\n## Task\n" + task_prompt
 
     # Mark as processing
@@ -644,6 +675,12 @@ def main():
     active = count_processing()
     if active >= MAX_CONCURRENT:
         log(f"At capacity: {active}/{MAX_CONCURRENT} tasks processing. Skipping.")
+        return
+
+    # User-controlled pause — set via the dashboard. Housekeeping still
+    # runs but no new tasks get pulled from queued.
+    if (CONFIG_DIR / ".paused").exists():
+        log("Paused by user; skipping new task starts.")
         return
 
     # Don't start new tasks while any task is still in a credit hold. The
