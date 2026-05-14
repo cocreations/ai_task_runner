@@ -350,6 +350,33 @@ def requeue_ready_awaiting_tasks():
                 log(f"Error re-queueing {task_file.name}: {e}")
 
 
+def earliest_pending_credit_hold() -> datetime | None:
+    """Return the earliest future credit_reset_at across all parked tasks,
+    or None if no task is currently in a credit hold. Call after
+    requeue_ready_awaiting_tasks() — anything still parked has a future reset."""
+    now = datetime.now(timezone.utc)
+    earliest: datetime | None = None
+    for awaiting_dir in (AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR):
+        if not awaiting_dir.exists():
+            continue
+        for task_file in awaiting_dir.glob("*.md"):
+            try:
+                post = frontmatter.load(str(task_file))
+                reset_raw = post.metadata.get("credit_reset_at")
+                if not reset_raw:
+                    continue
+                reset_dt = datetime.fromisoformat(reset_raw)
+                if reset_dt.tzinfo is None:
+                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+                if reset_dt <= now:
+                    continue
+                if earliest is None or reset_dt < earliest:
+                    earliest = reset_dt
+            except Exception:
+                continue
+    return earliest
+
+
 def looks_like_resume_failure(log_path: Path) -> bool:
     """Heuristic: did a --resume invocation fail because the session was missing?"""
     try:
@@ -617,6 +644,15 @@ def main():
     active = count_processing()
     if active >= MAX_CONCURRENT:
         log(f"At capacity: {active}/{MAX_CONCURRENT} tasks processing. Skipping.")
+        return
+
+    # Don't start new tasks while any task is still in a credit hold. The
+    # credit pool is account-wide, so a new run would just hit the same
+    # limit and bounce into awaiting_credits too — burning a bit of credit
+    # each time and cascading the whole queue into the parking dirs.
+    hold_until = earliest_pending_credit_hold()
+    if hold_until is not None:
+        log(f"Credit hold active until {hold_until.isoformat()}; skipping new task starts.")
         return
 
     # Load config
