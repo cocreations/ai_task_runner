@@ -647,8 +647,27 @@ def list_projects() -> str:
     return "\n\n".join(lines)
 
 
+# ── CORS (allow browser dashboards to call MCP tools) ──
+
+from starlette.middleware.cors import CORSMiddleware
+
+CORS_ORIGINS = [
+    "https://pipeline.momentevents.co",
+    "https://moment-pipeline-dashboard.web.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+]
+
 # ── Entry point ──
 
 if __name__ == "__main__":
-    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
-    mcp.run(transport=transport)
+    app = mcp.streamable_http_app()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "Mcp-Session-Id"],
+        expose_headers=["Mcp-Session-Id"],
+    )
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
