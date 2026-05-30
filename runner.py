@@ -160,8 +160,8 @@ def update_frontmatter(path: Path, **updates) -> frontmatter.Post:
     post = frontmatter.load(str(path))
     for key, value in updates.items():
         post.metadata[key] = value
-    with open(path, "wb") as f:
-        frontmatter.dump(post, f)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
     return post
 
 

@@ -471,8 +471,8 @@ def submit_task(project: str, prompt: str, max_timeout_minutes: int = 120) -> st
     )
 
     task_path = STATUS_DIRS["queued"] / f"{task_id}.md"
-    with open(task_path, "wb") as f:
-        frontmatter.dump(post, f)
+    with open(task_path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
 
     return f"Task queued: {task_id}\nProject: {project}\nTimeout: {max_timeout_minutes}m\nIt will be picked up within seconds."
 
@@ -570,8 +570,8 @@ def cancel_task(task_id: str) -> str:
     post.metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
 
     failed_path = STATUS_DIRS["failed"] / f"{task_id}.md"
-    with open(failed_path, "wb") as f:
-        frontmatter.dump(post, f)
+    with open(failed_path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
     queued_path.unlink()
 
     return f"Task {task_id} cancelled."

@@ -68,8 +68,8 @@ def main():
 
     QUEUED_DIR.mkdir(parents=True, exist_ok=True)
     task_path = QUEUED_DIR / f"{task_id}.md"
-    with open(task_path, "wb") as f:
-        frontmatter.dump(post, f)
+    with open(task_path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
 
     print(f"TASK_ID={task_id}")
 
