@@ -100,13 +100,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ---------------------------------------------------------------------------
-# Playwright + headless Chromium (for visual checks like moment-qa-gate's
-# landing-page screenshots). Browsers installed to a shared system path so
-# both root and taskrunner can use them. --with-deps pulls in the apt
-# system libraries Chromium needs (libglib-2.0, libnss3, libxkbcommon, etc.).
+# Playwright + headless Chromium + Pillow (for visual checks like
+# moment-qa-gate's landing-page screenshots and the outreach home-screen
+# preview). Pillow is REQUIRED, not optional: moment-agents' screenshot_app_home
+# and web_preview use it for the pixel/blank detection (spinner vs real content)
+# and the JPEG transcode. Without Pillow those checks silently no-op — the
+# screenshot is captured blind with no verification — which shipped loading
+# spinners as outreach hero images (moment-agents#13). Browsers go to a shared
+# system path so both root and taskrunner can use them; --with-deps pulls in the
+# apt system libraries Chromium needs (libglib-2.0, libnss3, libxkbcommon, etc.).
 # ---------------------------------------------------------------------------
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
-RUN pip install --no-cache-dir playwright \
+RUN pip install --no-cache-dir playwright Pillow \
     && playwright install --with-deps chromium \
     && chmod -R a+rX /opt/playwright
 
