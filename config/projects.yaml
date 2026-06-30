@@ -2,8 +2,9 @@ projects:
   moment:
     directory: /home/deploy/apps/moment
     description: "Moment Events — sales pipeline, demo builder"
-    env:
-      GOOGLE_APPLICATION_CREDENTIALS: /home/deploy/apps/moment/credentials/live-service-account.json
+    # Firebase creds: drop live-service-account.json into the moment-agents repo
+    # at <directory>/moment-agents/credentials/ via the Projects file UI. The
+    # pipeline resolves only that path — no GOOGLE_APPLICATION_CREDENTIALS env var.
     allowed_users:
       - kris
       - michael
