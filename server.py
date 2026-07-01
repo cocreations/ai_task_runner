@@ -430,7 +430,13 @@ async def auth_page_post_route(request: Request):
 
 
 @mcp.tool()
-def submit_task(project: str, prompt: str, max_timeout_minutes: int = 120) -> str:
+def submit_task(
+    project: str,
+    prompt: str,
+    max_timeout_minutes: int = 120,
+    claude_session_id: str = "",
+    session_started: bool = False,
+) -> str:
     """Submit a task for headless Claude Code execution.
 
     The task will be queued and picked up within seconds by the runner.
@@ -439,6 +445,12 @@ def submit_task(project: str, prompt: str, max_timeout_minutes: int = 120) -> st
         project: Project name (from projects.yaml) — determines working directory.
         prompt: The prompt/instructions for Claude Code to execute.
         max_timeout_minutes: Maximum execution time (default 120, max 180).
+        claude_session_id: Optional. Pin the Claude Code session to this id so a
+            series of tasks form ONE continuous conversation. Omit for a fresh
+            one-off session (the default).
+        session_started: Optional. When claude_session_id is set, pass False on
+            the first task (the runner uses --session-id to create it) and True
+            on subsequent tasks (the runner uses --resume to continue it).
     """
     username = get_current_user()
 
@@ -457,8 +469,7 @@ def submit_task(project: str, prompt: str, max_timeout_minutes: int = 120) -> st
     task_id = generate_task_id()
     now = datetime.now(timezone.utc).isoformat()
 
-    post = frontmatter.Post(
-        content=prompt,
+    fields = dict(
         id=task_id,
         user=username,
         project=project,
@@ -469,6 +480,13 @@ def submit_task(project: str, prompt: str, max_timeout_minutes: int = 120) -> st
         exit_code=None,
         max_timeout_minutes=max_timeout_minutes,
     )
+    # Session continuity (optional): the runner already honors these frontmatter
+    # keys — claude_session_id + session_started drive --session-id vs --resume.
+    if claude_session_id:
+        fields["claude_session_id"] = claude_session_id
+        fields["session_started"] = bool(session_started)
+
+    post = frontmatter.Post(content=prompt, **fields)
 
     task_path = STATUS_DIRS["queued"] / f"{task_id}.md"
     with open(task_path, "w", encoding="utf-8") as f:
