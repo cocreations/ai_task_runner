@@ -436,6 +436,7 @@ def submit_task(
     max_timeout_minutes: int = 120,
     claude_session_id: str = "",
     session_started: bool = False,
+    attachments: list | None = None,
 ) -> str:
     """Submit a task for headless Claude Code execution.
 
@@ -451,6 +452,10 @@ def submit_task(
         session_started: Optional. When claude_session_id is set, pass False on
             the first task (the runner uses --session-id to create it) and True
             on subsequent tasks (the runner uses --resume to continue it).
+        attachments: Optional. A list of {name, contentType, url} objects. The
+            runner downloads each url into a per-task directory and lists the
+            local paths in the prompt so the session can read/view them. Only
+            metadata + URLs travel here — never file bytes.
     """
     username = get_current_user()
 
@@ -485,6 +490,21 @@ def submit_task(
     if claude_session_id:
         fields["claude_session_id"] = claude_session_id
         fields["session_started"] = bool(session_started)
+
+    # Attachments (optional): keep only the fields the runner needs, and only
+    # well-formed entries. Bytes never travel here — just metadata + a URL the
+    # runner fetches.
+    if attachments:
+        clean = []
+        for a in attachments:
+            if isinstance(a, dict) and isinstance(a.get("url"), str) and a["url"]:
+                clean.append({
+                    "name": str(a.get("name") or "file")[:200],
+                    "contentType": str(a.get("contentType") or "application/octet-stream"),
+                    "url": a["url"],
+                })
+        if clean:
+            fields["attachments"] = clean
 
     post = frontmatter.Post(content=prompt, **fields)
 

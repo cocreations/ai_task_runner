@@ -16,6 +16,7 @@ Usage:
 import json as json_mod
 import os
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -431,6 +432,99 @@ def finalize_task(task_path: Path, status: str, exit_code: int | None = None,
     log(f"Task {task_path.stem} → {status} (exit_code={exit_code})")
 
 
+ATTACH_MAX_BYTES = 10 * 1024 * 1024  # 10MB per file
+ATTACH_TIMEOUT_S = 30
+
+
+def _attach_dir(project_dir: str, task_id: str) -> Path:
+    return Path(project_dir) / ".ai-attachments" / task_id
+
+
+def _attach_safe_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "").strip("._") or "file"
+    return safe[:120]
+
+
+def download_attachments(meta: dict, project_dir: str, task_id: str) -> str:
+    """Download any task attachments into a per-task dir and return a prompt
+    block listing their local paths (+ source URLs). Bytes come only from the
+    URLs the caller supplied (public Firebase Storage download URLs — no creds
+    needed). Best-effort: a file that fails to download is still listed with its
+    URL so the session can fetch it itself."""
+    import urllib.request
+
+    attachments = meta.get("attachments") or []
+    if not isinstance(attachments, list) or not attachments:
+        return ""
+
+    dest = _attach_dir(project_dir, task_id)
+    # Fresh dir each run (re-queued tasks re-download).
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(dest, 0o775)
+    except OSError:
+        pass
+
+    lines = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        url = att.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        name = str(att.get("name") or "file")
+        ctype = str(att.get("contentType") or "application/octet-stream")
+        local_path = dest / _attach_safe_name(name)
+        ok = False
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "moment-ai-runner"})
+            with urllib.request.urlopen(req, timeout=ATTACH_TIMEOUT_S) as resp:
+                total = 0
+                with open(local_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > ATTACH_MAX_BYTES:
+                            raise ValueError("attachment exceeds 10MB")
+                        f.write(chunk)
+            try:
+                os.chmod(local_path, 0o664)
+            except OSError:
+                pass
+            ok = True
+        except Exception as e:  # noqa: BLE001 — best-effort, keep the URL in the prompt
+            log(f"Task {task_id}: could not download attachment {name}: {e}")
+            if local_path.exists():
+                local_path.unlink(missing_ok=True)
+
+        if ok:
+            lines.append(f"- {name} ({ctype}) — local: {local_path} — url: {url}")
+        else:
+            lines.append(f"- {name} ({ctype}) — url: {url} (download failed; fetch it yourself if needed)")
+
+    if not lines:
+        return ""
+    return (
+        "\n## Attachments\n"
+        "The owner attached these files (already saved locally). Read them to do "
+        "what they asked. For an image the owner wants shown in the app, use its "
+        "`url` (a Firebase Storage URL) directly as the image field value — it "
+        "already loads in the installed app.\n" + "\n".join(lines) + "\n"
+    )
+
+
+def cleanup_attachments(project_dir: str, task_id: str) -> None:
+    """Remove a task's downloaded attachments (best-effort)."""
+    try:
+        shutil.rmtree(_attach_dir(project_dir, task_id), ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def load_skills(project_dir: str) -> str:
     """Load all installed SKILL.md files and return as prompt context."""
     skills_dir = Path(project_dir).parent / ".skills"
@@ -529,7 +623,11 @@ def run_task(task_path: Path, projects: dict, users: dict):
     if default_model and not has_model_override(task_prompt):
         task_prompt = f"/model {default_model};\n\n" + task_prompt
 
-    prompt = system_context + skills_context + "\n## Task\n" + task_prompt
+    # Download any attachments locally and describe them in the prompt (cleaned
+    # up in the finally below). No-op when the task has none.
+    attach_block = download_attachments(meta, project_dir, task_id)
+
+    prompt = system_context + skills_context + "\n## Task\n" + task_prompt + attach_block
 
     # Mark as processing
     now = datetime.now(timezone.utc).isoformat()
@@ -625,6 +723,11 @@ def run_task(task_path: Path, projects: dict, users: dict):
         with open(log_path, "a") as f:
             f.write(f"\n\n--- ERROR ---\n{e}\n")
         finalize_task(task_path, "failed", exit_code=-2)
+
+    finally:
+        # Attachments are re-downloaded on any re-queue, so it's always safe to
+        # remove them once this run's claude subprocess has finished.
+        cleanup_attachments(project_dir, task_id)
 
 
 def reap_stale_tasks():
