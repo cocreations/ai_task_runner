@@ -636,6 +636,12 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # Build environment — run claude as non-root taskrunner user
     env = os.environ.copy()
     env["HOME"] = "/home/taskrunner"
+    # Disable Claude Code background tasks. Each task is one-shot headless
+    # (`claude -p`): a backgrounded Bash job is killed ~5s after the turn
+    # returns and nothing re-invokes the model to "check back", so background
+    # work silently dies while the runner still sees exit 0. Forcing everything
+    # synchronous makes tasks either finish their work or fail honestly.
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     # Bridge submitter identity into the subprocess. getpass.getuser() returns
     # "taskrunner" on the VPS; consumers that need the actual submitter (e.g.
     # moment-agents stamping `owner` on prospects) read CLAUDE_USER.
