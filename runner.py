@@ -13,6 +13,7 @@ Usage:
     MAX_CONCURRENT=4 python runner.py   # Override concurrency limit
 """
 
+import hashlib
 import json as json_mod
 import os
 import re
@@ -37,6 +38,12 @@ DONE_DIR = TASKS_DIR / "done"
 FAILED_DIR = TASKS_DIR / "failed"
 AWAITING_CREDITS_DIR = TASKS_DIR / "awaiting_credits"
 AWAITING_WEEKLY_RESET_DIR = TASKS_DIR / "awaiting_weekly_reset"
+# Non-secret fingerprint of the Claude account whose credit limit last parked a
+# task. Stored under tasks/ (rw) because config/ is mounted read-only. When the
+# connected token changes, any credit hold parked under the old account is stale
+# (a new account has its own credit pool), so it gets cleared — see
+# clear_credit_hold_on_token_change().
+AUTH_FP_FILE = TASKS_DIR / ".claude_auth_fp"
 
 # Pattern for Claude's credit-limit error, e.g.
 #   "You've hit your limit · resets 9:30pm (UTC)"     (kind absent — current format)
@@ -324,6 +331,29 @@ def finalize_awaiting(task_path: Path, kind: str, reset_at: datetime,
     log(f"Task {task_path.stem} hit {kind} limit → {status}, retry at {reset_at.isoformat()}")
 
 
+def _requeue_awaiting_file(task_file: Path, reason: str, fresh_session: bool = False):
+    """Move one parked awaiting_* task back to queued.
+
+    Normally the task resumes its existing Claude session (`--resume`). Pass
+    fresh_session=True when the account/token changed: that path recreates the
+    container and wipes the old session, so a new session id is minted and the
+    task re-runs from scratch on the new account (a `--resume` would just fail)."""
+    now = datetime.now(timezone.utc)
+    QUEUED_DIR.mkdir(parents=True, exist_ok=True)
+    updates = {
+        "status": "queued",
+        "requeued_at": now.isoformat(),
+        "requeue_reason": reason,
+    }
+    if fresh_session:
+        updates["claude_session_id"] = str(uuid.uuid4())
+        updates["session_started"] = False
+    else:
+        updates["session_started"] = True
+    update_frontmatter(task_file, **updates)
+    os.rename(task_file, QUEUED_DIR / task_file.name)
+
+
 def requeue_ready_awaiting_tasks():
     """Move tasks from awaiting_* back to queued once their credit_reset_at has passed."""
     now = datetime.now(timezone.utc)
@@ -341,14 +371,66 @@ def requeue_ready_awaiting_tasks():
                     reset_dt = reset_dt.replace(tzinfo=timezone.utc)
                 if reset_dt > now:
                     continue
-                QUEUED_DIR.mkdir(parents=True, exist_ok=True)
-                update_frontmatter(task_file, status="queued",
-                                    requeued_at=now.isoformat(),
-                                    session_started=True)
-                os.rename(task_file, QUEUED_DIR / task_file.name)
+                _requeue_awaiting_file(task_file, "credit reset reached")
                 log(f"Task {task_file.stem} credit reset reached — re-queued for resume")
             except Exception as e:
                 log(f"Error re-queueing {task_file.name}: {e}")
+
+
+def _current_auth_fingerprint() -> str:
+    """Short, non-secret fingerprint of the connected Claude credentials.
+
+    Derived from the OAuth token (or API key) the runner will hand to `claude`.
+    Changes iff the account/token changes; empty string if none is configured.
+    Never stores or logs the token itself — only a truncated SHA-256 hash."""
+    material = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+                or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if not material:
+        return ""
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def clear_credit_hold_on_token_change():
+    """Drop a stale credit hold when the connected Claude account changes.
+
+    A parked task's `credit_reset_at` is the reset time of *the account that hit
+    the limit*. If the user swaps in a different token (e.g. an account that
+    still has credits), that reset time is meaningless — the new account has its
+    own credit pool — yet `earliest_pending_credit_hold()` would keep the runner
+    paused until the old account's reset. So whenever the token fingerprint
+    changes, re-queue every awaiting_* task immediately to retry on the new
+    account. Runs each tick (every ~5s), so a token swap un-sticks the runner
+    almost at once."""
+    fp = _current_auth_fingerprint()
+    if not fp:
+        return  # No token visible — nothing reliable to compare against.
+    try:
+        prev = AUTH_FP_FILE.read_text().strip() if AUTH_FP_FILE.exists() else ""
+    except Exception:
+        prev = ""
+    if prev == fp:
+        return
+    # Only force a re-queue when a *different* account was seen before; on the
+    # first-ever observation there is nothing parked under an old account.
+    if prev:
+        count = 0
+        for awaiting_dir in (AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR):
+            if not awaiting_dir.exists():
+                continue
+            for task_file in awaiting_dir.glob("*.md"):
+                try:
+                    _requeue_awaiting_file(task_file, "claude token changed",
+                                           fresh_session=True)
+                    count += 1
+                except Exception as e:
+                    log(f"Error re-queueing {task_file.name} after token change: {e}")
+        if count:
+            log(f"Claude token changed — cleared credit hold, re-queued {count} "
+                f"task(s) to retry on the new account.")
+    try:
+        AUTH_FP_FILE.write_text(fp)
+    except Exception as e:
+        log(f"Could not persist Claude auth fingerprint: {e}")
 
 
 MODEL_DIRECTIVE_RE = re.compile(r"^\s*/model\s+\S+", re.MULTILINE)
@@ -773,6 +855,11 @@ def main():
     for d in [QUEUED_DIR, PROCESSING_DIR, DONE_DIR, FAILED_DIR,
              AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR, LOGS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
+
+    # If the connected Claude account changed, drop any stale credit hold so
+    # parked tasks retry on the new account instead of waiting out the old
+    # (out-of-credit) account's reset time.
+    clear_credit_hold_on_token_change()
 
     # Re-queue any credit-held tasks whose reset time has passed
     requeue_ready_awaiting_tasks()
