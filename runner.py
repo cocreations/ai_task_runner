@@ -514,8 +514,8 @@ def finalize_task(task_path: Path, status: str, exit_code: int | None = None,
     log(f"Task {task_path.stem} → {status} (exit_code={exit_code})")
 
 
-ATTACH_MAX_BYTES = 10 * 1024 * 1024  # 10MB per file
-ATTACH_TIMEOUT_S = 30
+ATTACH_MAX_BYTES = 500 * 1024 * 1024  # 500MB per file (zips carry whole image sets)
+ATTACH_TIMEOUT_S = 30  # socket-inactivity timeout, not total — big files stream fine
 
 
 def _attach_dir(project_dir: str, task_id: str) -> Path:
@@ -571,7 +571,7 @@ def download_attachments(meta: dict, project_dir: str, task_id: str) -> str:
                             break
                         total += len(chunk)
                         if total > ATTACH_MAX_BYTES:
-                            raise ValueError("attachment exceeds 10MB")
+                            raise ValueError("attachment exceeds size limit")
                         f.write(chunk)
             try:
                 os.chmod(local_path, 0o664)
