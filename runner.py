@@ -32,6 +32,12 @@ CONFIG_DIR = BASE_DIR / "config"
 TASKS_DIR = BASE_DIR / "tasks"
 LOGS_DIR = BASE_DIR / "logs"
 
+# Per-project requirements manifest (in each project repo root) and the
+# directory where the hosting platform materializes per-project MCP config
+# (bind-mounted read-only into the container; absent on self-hosted setups).
+MANIFEST_NAME = "agent-requirements.yaml"
+MCP_CONFIG_DIR = Path(os.environ.get("MCP_CONFIG_DIR", "/secrets/mcp"))
+
 QUEUED_DIR = TASKS_DIR / "queued"
 PROCESSING_DIR = TASKS_DIR / "processing"
 DONE_DIR = TASKS_DIR / "done"
@@ -134,6 +140,91 @@ def load_users() -> dict:
     with open(path) as f:
         data = yaml.safe_load(f) or {}
     return data.get("users", {})
+
+
+def load_requirements_manifest(project_dir: str) -> tuple[list, str | None]:
+    """Read the project's agent-requirements.yaml.
+
+    Returns (requirements, error). Absent manifest -> ([], None): projects that
+    don't declare requirements behave exactly as before. A malformed manifest
+    returns ([], "<error>") so the caller can fail the task with a pointer at
+    the file instead of crashing the poll loop or silently ignoring it.
+    """
+    path = Path(project_dir) / MANIFEST_NAME
+    if not path.is_file():
+        return [], None
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        reqs = data.get("requirements", [])
+        if not isinstance(reqs, list):
+            return [], f"'requirements' must be a list, got {type(reqs).__name__}"
+        return [r for r in reqs if isinstance(r, dict)], None
+    except yaml.YAMLError as e:
+        return [], f"YAML parse error: {e}"
+
+
+def _requirement_failure(req: dict, problem: str) -> str:
+    """Format one unmet requirement as a self-explanatory failure block."""
+    lines = [f"- {req.get('id', 'unnamed requirement')}: {problem}"]
+    why = str(req.get("why", "")).strip()
+    how = str(req.get("how_to_get", "")).strip()
+    if why:
+        lines.append(f"  Why it's needed: {why}")
+    if how:
+        lines.append(f"  How to get it: {how}")
+    return "\n".join(lines)
+
+
+def check_requirements(project_name: str, project_dir: str, env: dict) -> list[str]:
+    """Verify the project's declared requirements before spending Claude time.
+
+    Returns one human-readable failure string per unmet requirement (empty
+    list = all satisfied, or no manifest).
+    """
+    reqs, error = load_requirements_manifest(project_dir)
+    if error:
+        return [f"- {MANIFEST_NAME} in the project repo is invalid ({error}). "
+                "Fix the manifest and push/sync the project."]
+
+    mcp_servers = None  # lazy-loaded from the materialized MCP config
+
+    failures = []
+    for req in reqs:
+        kind = req.get("kind")
+        if kind == "mcp_server":
+            if mcp_servers is None:
+                try:
+                    with open(MCP_CONFIG_DIR / f"{project_name}.mcp.json") as f:
+                        mcp_servers = json_mod.load(f).get("mcpServers") or {}
+                except (OSError, json_mod.JSONDecodeError):
+                    mcp_servers = {}
+            server_name = req.get("server_name", "")
+            if server_name not in mcp_servers:
+                if req.get("provider") == "task-runner-self":
+                    failures.append(_requirement_failure(
+                        req, "the runner's own MCP server should be configured "
+                             "automatically — restart or recreate your container, "
+                             "or contact support if that doesn't fix it"))
+                else:
+                    failures.append(_requirement_failure(
+                        req, f"MCP server '{server_name}' is not configured"))
+        elif kind == "env":
+            for var in req.get("vars", []):
+                name = var.get("name") if isinstance(var, dict) else str(var)
+                if name and name not in env:
+                    failures.append(_requirement_failure(
+                        req, f"environment variable {name} is not set"))
+        elif kind == "file":
+            rel = str(req.get("path", ""))
+            if not rel or rel.startswith(("/", "~")) or ".." in rel.split("/"):
+                failures.append(_requirement_failure(
+                    req, f"invalid file path in manifest: {rel!r}"))
+            elif not (Path(project_dir) / rel).is_file():
+                failures.append(_requirement_failure(
+                    req, f"required file {rel} is missing from the project"))
+        # Unknown kinds are ignored (forward compatibility with newer manifests).
+    return failures
 
 
 def count_processing() -> int:
@@ -690,6 +781,24 @@ def run_task(task_path: Path, projects: dict, users: dict):
     domain_parts = domain.split(".", 1)
     base_domain = domain_parts[1] if len(domain_parts) > 1 else domain
 
+    # Preflight: if the project declares requirements (agent-requirements.yaml)
+    # that aren't configured, fail fast with the manifest's own why/how_to_get
+    # text. Otherwise the model starts, discovers mid-task that a tool or
+    # credential is missing, and either improvises or stalls — neither of
+    # which tells anyone what to fix.
+    effective_env = {**os.environ,
+                     **{k: str(v) for k, v in project.get("env", {}).items()}}
+    req_failures = check_requirements(project_name, project_dir, effective_env)
+    if req_failures:
+        log(f"Task {task_id}: {len(req_failures)} unmet requirement(s) — failing fast")
+        finalize_task(task_path, "failed", exit_code=1, result_summary=(
+            f"Task blocked — this project declares requirements ({MANIFEST_NAME}) "
+            "that are not configured:\n\n"
+            + "\n\n".join(req_failures)
+            + f"\n\nConfigure them at https://{base_domain}/dashboard under "
+              f"Projects → {project_name} → Requirements."))
+        return
+
     system_context = SYSTEM_CONTEXT_TEMPLATE.format(
         project_name=project_name,
         username=username,
@@ -742,6 +851,15 @@ def run_task(task_path: Path, projects: dict, users: dict):
     claude_cmd = ["claude", session_flag, claude_session_id, "-p", prompt,
                   "--output-format", "stream-json", "--verbose",
                   "--dangerously-skip-permissions"]
+
+    # Per-project MCP servers: the hosting platform materializes a claude-format
+    # MCP config at /secrets/mcp/<project>.mcp.json (bind-mounted, so it
+    # survives container recreates). --strict-mcp-config makes that file the
+    # ONLY MCP source, so stray per-user state inside the container (e.g. a
+    # hand-edited ~/.claude.json) can never affect tasks.
+    mcp_config_path = MCP_CONFIG_DIR / f"{project_name}.mcp.json"
+    if mcp_config_path.is_file():
+        claude_cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
 
     # Launch Claude Code. Log file is line-buffered so each NDJSON event
     # flushes to disk immediately — the platform's web dashboard tails this
