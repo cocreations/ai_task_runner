@@ -431,10 +431,22 @@ def _requeue_awaiting_file(task_file: Path, reason: str, fresh_session: bool = F
     task re-runs from scratch on the new account (a `--resume` would just fail)."""
     now = datetime.now(timezone.utc)
     QUEUED_DIR.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.load(str(task_file))
     updates = {
         "status": "queued",
         "requeued_at": now.isoformat(),
         "requeue_reason": reason,
+        # Clear the execution clock. `reap_stale_tasks` measures elapsed as
+        # `now - started_at`, so leaving the old value here would charge the
+        # time spent parked in awaiting_* against max_timeout_minutes — a task
+        # held across a 5-hour credit reset came back already "over limit" and
+        # was reaped on release, before running a single token. `started_at` is
+        # re-stamped when the task next enters processing; the reaper skips a
+        # falsy value, so a queued task is simply not a reap candidate.
+        "started_at": None,
+        # Keep the original start for observability (first run only).
+        "first_started_at": post.metadata.get("first_started_at")
+                            or post.metadata.get("started_at"),
     }
     if fresh_session:
         updates["claude_session_id"] = str(uuid.uuid4())
