@@ -38,6 +38,13 @@ LOGS_DIR = BASE_DIR / "logs"
 MANIFEST_NAME = "agent-requirements.yaml"
 MCP_CONFIG_DIR = Path(os.environ.get("MCP_CONFIG_DIR", "/secrets/mcp"))
 
+# GitHub token file dropped by the hosting platform (bind-mounted read-only;
+# absent on self-hosted setups, which pass GH_TOKEN as an env var instead).
+# Read before every task so a token update applies without a restart — env
+# vars are frozen at `docker create` and can't carry updates.
+GH_TOKEN_FILE = Path("/secrets/github_token")
+GIT_CREDENTIALS_FILE = Path("/home/taskrunner/.git-credentials")
+
 QUEUED_DIR = TASKS_DIR / "queued"
 PROCESSING_DIR = TASKS_DIR / "processing"
 DONE_DIR = TASKS_DIR / "done"
@@ -725,6 +732,59 @@ def load_skills(project_dir: str) -> str:
     return "\n## Installed Skills\n\n" + "\n\n---\n\n".join(parts) + "\n"
 
 
+def refresh_git_credentials():
+    """Sync /home/taskrunner/.git-credentials with /secrets/github_token.
+
+    The platform writes token updates to the mounted secrets dir; the env var
+    (GH_TOKEN) is frozen at container creation and goes stale as soon as the
+    user saves a new token. Running this before each task means a new token
+    applies to the very next task — no restart or recreate needed.
+    No-op on self-hosted setups where the file doesn't exist.
+    """
+    try:
+        if not GH_TOKEN_FILE.is_file():
+            return
+        token = GH_TOKEN_FILE.read_text().strip()
+        if not token:
+            return
+        line = f"https://x-access-token:{token}@github.com\n"
+        if (GIT_CREDENTIALS_FILE.exists()
+                and GIT_CREDENTIALS_FILE.read_text() == line):
+            return
+        GIT_CREDENTIALS_FILE.write_text(line)
+        os.chmod(GIT_CREDENTIALS_FILE, 0o600)
+        shutil.chown(GIT_CREDENTIALS_FILE, "taskrunner", "taskrunner")
+        log("Refreshed git credentials from /secrets/github_token")
+    except Exception as e:  # noqa: BLE001 — never let git auth block a task
+        log(f"git credential refresh failed (continuing): {e}")
+
+
+def ensure_workspace_ownership(project_dir: str):
+    """Chown project files to taskrunner if anything is owned by someone else.
+
+    Host-side operations (platform repo clone/sync, SCP uploads) create files
+    as root inside the bind mount; the entrypoint only chowns /workspace at
+    container start, so a project added while the container is running is
+    root-owned — and claude (running as taskrunner) can't even write
+    .git/FETCH_HEAD. Cheap when ownership is already correct: the find exits
+    on the first mismatch and we skip the chown entirely.
+    """
+    try:
+        if os.geteuid() != 0:
+            return  # can't chown; also implies files weren't dropped by root
+        check = subprocess.run(
+            ["find", project_dir, "-not", "-user", "taskrunner",
+             "-print", "-quit"],
+            capture_output=True, text=True, timeout=60)
+        if not check.stdout.strip():
+            return
+        subprocess.run(["chown", "-R", "taskrunner:taskrunner", project_dir],
+                       capture_output=True, timeout=300)
+        log(f"Fixed ownership of {project_dir} (foreign-owned files → taskrunner)")
+    except Exception as e:  # noqa: BLE001 — best-effort, never block the task
+        log(f"ownership fix failed for {project_dir} (continuing): {e}")
+
+
 def run_task(task_path: Path, projects: dict, users: dict):
     """Execute a task via headless Claude Code CLI."""
     post = frontmatter.load(str(task_path))
@@ -769,6 +829,13 @@ def run_task(task_path: Path, projects: dict, users: dict):
         log(f"Task {task_id}: project directory '{project_dir}' does not exist")
         finalize_task(task_path, "failed", exit_code=1)
         return
+
+    # Pre-task hygiene: pick up any GitHub token saved since container
+    # creation, and fix ownership of files dropped into the bind mount by
+    # host-side operations (platform clone/sync, SCP). Both are no-ops when
+    # nothing changed.
+    refresh_git_credentials()
+    ensure_workspace_ownership(project_dir)
 
     # Check disk usage against limit
     workspace_dir = Path(project_dir).parent

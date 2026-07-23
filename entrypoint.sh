@@ -10,12 +10,23 @@ chmod -R 775 /workspace /app/tasks /app/logs /app/artifacts
 
 # Configure git for the taskrunner user. Tasks run as `taskrunner` so all
 # global git config has to live in /home/taskrunner.
+#
+# The GitHub token is read from /secrets/github_token (bind-mounted, updatable
+# at any time) in preference to $GH_TOKEN — env vars are frozen at
+# `docker create`, so a token saved after container creation never reaches the
+# env. The runner also re-reads this file before every task, so a new token
+# takes effect without any restart.
+if [ -f /secrets/github_token ]; then
+    GH_TOKEN="$(cat /secrets/github_token)"
+fi
 if [ -n "$GH_TOKEN" ]; then
     printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /home/taskrunner/.git-credentials
     chown taskrunner:taskrunner /home/taskrunner/.git-credentials
     chmod 600 /home/taskrunner/.git-credentials
-    su -s /bin/bash taskrunner -c "git config --global credential.helper store"
 fi
+# Always enable the store helper (harmless with no credentials file) so a
+# token added later — via /secrets/github_token — works without reconfiguring.
+su -s /bin/bash taskrunner -c "git config --global credential.helper store"
 su -s /bin/bash taskrunner -c "git config --global --add safe.directory '*'"
 if [ -n "$GIT_AUTHOR_NAME" ]; then
     su -s /bin/bash taskrunner -c "git config --global user.name '${GIT_AUTHOR_NAME}'"
