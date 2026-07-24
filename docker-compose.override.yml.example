@@ -12,7 +12,6 @@ services:
     volumes:
       # Project directories — one line per project in projects.yaml:
       - /home/deploy/apps/moment:/home/deploy/apps/moment
-      - /home/deploy/apps/lor-elementals:/home/deploy/apps/lor-elementals
 
       # Skills directory (sibling of the project dirs):
       - /home/deploy/apps/.skills:/home/deploy/apps/.skills:ro
