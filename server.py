@@ -634,7 +634,19 @@ def task_output(task_id: str) -> str:
         status = post.metadata.get("status", "unknown")
         if status in ("queued", "processing"):
             return f"Task is still '{status}' — output not yet available."
-        return f"No log file found for task '{task_id}'."
+        # No log file means the task failed BEFORE the worker started — a
+        # pre-flight rejection (disk limit, unmet requirements, bad project/user
+        # …). The runner records why in result_summary; surface that instead of a
+        # bare "no log", which reads as a crash and hides an actionable message.
+        summary = post.metadata.get("result_summary")
+        exit_code = post.metadata.get("exit_code")
+        header = f"Task '{task_id}' {status}"
+        if exit_code is not None:
+            header += f" (exit {exit_code})"
+        header += " — it failed before execution started, so there is no run log."
+        if summary:
+            return f"{header}\n\n{summary}"
+        return header + " No further detail was recorded."
 
     content = log_path.read_text()
     if len(content) > 50000:

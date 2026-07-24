@@ -813,21 +813,27 @@ def run_task(task_path: Path, projects: dict, users: dict):
     project = projects.get(project_name)
     if not project:
         log(f"Task {task_id}: unknown project '{project_name}'")
-        finalize_task(task_path, "failed", exit_code=1)
+        finalize_task(task_path, "failed", exit_code=1,
+                      result_summary=f"Unknown project '{project_name}'. "
+                                     "Check the project name against your Projects page.")
         return
 
     # Validate user access
     allowed = project.get("allowed_users", [])
     if username not in allowed:
         log(f"Task {task_id}: user '{username}' not allowed for project '{project_name}'")
-        finalize_task(task_path, "failed", exit_code=1)
+        finalize_task(task_path, "failed", exit_code=1,
+                      result_summary=f"User '{username}' is not allowed to run tasks for "
+                                     f"project '{project_name}'.")
         return
 
     # Validate project directory exists
     project_dir = project.get("directory", "")
     if not project_dir or not Path(project_dir).is_dir():
         log(f"Task {task_id}: project directory '{project_dir}' does not exist")
-        finalize_task(task_path, "failed", exit_code=1)
+        finalize_task(task_path, "failed", exit_code=1,
+                      result_summary=f"Project directory '{project_dir}' does not exist on "
+                                     "the runner. It may not be mounted or cloned yet.")
         return
 
     # Pre-task hygiene: pick up any GitHub token saved since container
