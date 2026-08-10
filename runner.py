@@ -27,6 +27,8 @@ from pathlib import Path
 import frontmatter
 import yaml
 
+import housekeeping
+
 BASE_DIR = Path(__file__).parent
 CONFIG_DIR = BASE_DIR / "config"
 TASKS_DIR = BASE_DIR / "tasks"
@@ -1063,6 +1065,10 @@ def main():
 
     # Reap any stale tasks before checking capacity
     reap_stale_tasks()
+
+    # Periodic hygiene: truncate runaway logs, kill processes that escaped
+    # finished tasks, clean stale /tmp debris. Self-throttled internally.
+    housekeeping.run()
 
     # Check concurrency limit
     active = count_processing()
