@@ -1,4 +1,7 @@
-mcp[cli]>=1.0.0
+# <2 pin: mcp 2.0.0 removed mcp.server.fastmcp (server.py's FastMCP import),
+# which crash-looped the container after an image rebuild on 2026-08-10.
+# Migrate server.py to the 2.x server API before lifting this.
+mcp[cli]>=1.0.0,<2
 pyyaml>=6.0
 # Pinned for deterministic builds. python-frontmatter 1.3.0's dump() writes a
 # str, so it needs a text-mode handle (1.1.0 tolerated binary "wb"). The code
