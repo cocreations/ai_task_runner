@@ -2,6 +2,9 @@ services:
   task-runner:
     build: .
     restart: unless-stopped
+    # PID 1 must reap: tasks can leave orphaned processes whose exit statuses
+    # otherwise accumulate as zombies under the (non-reaping) python entrypoint.
+    init: true
     env_file: .env
     volumes:
       - ./config:/app/config:ro
