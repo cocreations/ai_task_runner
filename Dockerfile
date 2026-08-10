@@ -103,7 +103,7 @@ RUN pip install --no-cache-dir playwright Pillow \
 RUN pip install --no-cache-dir "firebase-admin>=6.0.0" "requests>=2.28.0" "dnspython>=2.4.0"
 
 # Copy application code
-COPY server.py runner.py enqueue.py task_wait.py entrypoint.sh ./
+COPY server.py runner.py housekeeping.py enqueue.py task_wait.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 # Config and data are mounted as volumes
