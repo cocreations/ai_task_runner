@@ -24,7 +24,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY server.py runner.py enqueue.py task_wait.py entrypoint.sh ./
+COPY server.py runner.py housekeeping.py enqueue.py task_wait.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
 # Config and data are mounted as volumes
