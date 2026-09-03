@@ -704,9 +704,12 @@ from starlette.middleware.cors import CORSMiddleware
 CORS_ORIGINS = [
     "https://pipeline.momentevents.co",
     "https://moment-pipeline-dashboard.web.app",
+    "https://spellgrove.com",  # the Lor site's "Ask an agent" panel (2026-09-03)
     "http://localhost:5173",
     "http://localhost:5174",
 ]
+# Extra browser origins without a rebuild: CORS_EXTRA_ORIGINS="https://a.example,https://b.example"
+CORS_ORIGINS += [o.strip() for o in os.environ.get("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()]
 
 # ── Entry point ──
 
