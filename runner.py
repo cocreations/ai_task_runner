@@ -787,6 +787,53 @@ def ensure_workspace_ownership(project_dir: str):
         log(f"ownership fix failed for {project_dir} (continuing): {e}")
 
 
+def pull_project(project_dir: str) -> tuple[bool, str]:
+    """Fast-forward a git project's checkout before a task runs (projects.yaml
+    `pull_before_task: true`, set per project on the platform's Projects page).
+
+    Why: a task that runs on a stale checkout answers confidently about code
+    that no longer exists (a real case, 2026-09-08: a checkout six days old
+    reported "this game has no enemies"). A pull the MODEL is asked to do can
+    be skipped; one the runner does before the model starts cannot.
+
+    Returns (ok, message). Refuses — so the task FAILS instead of running
+    stale — when the tree has uncommitted changes to tracked files (a pull
+    would lose them), when the branch has diverged (no fast-forward), or when
+    the fetch fails. Runs as taskrunner (the checkout's owner) when root.
+    """
+    if not os.path.isdir(os.path.join(project_dir, ".git")):
+        return False, "The project directory is not a git repository."
+    env = os.environ.copy()
+    env["HOME"] = "/home/taskrunner"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    run_as = {"user": "taskrunner", "group": "taskrunner"} if os.geteuid() == 0 else {}
+
+    def git(args: list[str], timeout: int) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", project_dir, *args], capture_output=True,
+                              text=True, timeout=timeout, env=env, **run_as)
+
+    try:
+        status = git(["status", "--porcelain", "--untracked-files=no"], 60)
+        if status.returncode != 0:
+            return False, f"git status failed: {status.stderr.strip()}"
+        if status.stdout.strip():
+            dirty = [line[3:].strip() for line in status.stdout.splitlines() if len(line) > 3]
+            return False, ("Uncommitted changes to tracked files — a pull would lose them: "
+                           + ", ".join(dirty[:10]) + (" …" if len(dirty) > 10 else ""))
+        pull = git(["pull", "--ff-only"], 300)
+        if pull.returncode != 0:
+            # The last line is the reason ("Not possible to fast-forward", an auth
+            # refusal); the fetch chatter above it is not.
+            lines = [l for l in (pull.stderr + "\n" + pull.stdout).splitlines() if l.strip()]
+            return False, f"git pull --ff-only failed: {lines[-1].strip() if lines else 'no output'}"
+        head = git(["log", "-1", "--format=%h %s"], 30)
+        return True, f"now at {head.stdout.strip()}"
+    except subprocess.TimeoutExpired as e:
+        return False, f"git timed out: {e}"
+    except Exception as e:  # noqa: BLE001 — the message is the task's failure reason
+        return False, f"pull failed: {e}"
+
+
 def run_task(task_path: Path, projects: dict, users: dict):
     """Execute a task via headless Claude Code CLI."""
     post = frontmatter.load(str(task_path))
@@ -844,6 +891,21 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # nothing changed.
     refresh_git_credentials()
     ensure_workspace_ownership(project_dir)
+
+    # Pull before the task (projects.yaml `pull_before_task`): the runner does it, not
+    # the model, and a task never runs on a checkout it could not bring up to date.
+    checkout_note = ""
+    if project.get("pull_before_task"):
+        ok, msg = pull_project(project_dir)
+        log(f"Task {task_id}: pull before task — {msg}")
+        if not ok:
+            finalize_task(task_path, "failed", exit_code=1, result_summary=(
+                "Pull before task failed — the task did NOT run, so it could not work on "
+                f"a stale checkout.\n\n{msg}\n\nFix the checkout from the Projects page "
+                "(push pending changes, or pull), or switch off \"Pull before each task\" "
+                "for this project, then re-queue the task."))
+            return
+        checkout_note = f"\n## Checkout\nThe project checkout was pulled before this task: {msg}.\n"
 
     # Check disk usage against limit
     workspace_dir = Path(project_dir).parent
@@ -905,7 +967,7 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # up in the finally below). No-op when the task has none.
     attach_block = download_attachments(meta, project_dir, task_id)
 
-    prompt = system_context + skills_context + "\n## Task\n" + task_prompt + attach_block
+    prompt = system_context + checkout_note + skills_context + "\n## Task\n" + task_prompt + attach_block
 
     # Mark as processing
     now = datetime.now(timezone.utc).isoformat()

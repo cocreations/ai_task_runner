@@ -215,6 +215,10 @@ projects:
     description: "My web app"
     allowed_users:
       - kris
+    # Optional: fast-forward the checkout before every task (git projects). The
+    # runner refuses to start a task it could not bring up to date — uncommitted
+    # changes, a diverged branch — so no task ever runs on stale code.
+    pull_before_task: true
 ```
 
 ### Environment Variables (.env)
