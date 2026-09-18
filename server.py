@@ -43,6 +43,12 @@ STATUS_DIRS = {
     "processing": TASKS_DIR / "processing",
     "done": TASKS_DIR / "done",
     "failed": TASKS_DIR / "failed",
+    # Parked by the runner when the Claude account hits a usage limit; it moves
+    # them back to queued by itself once the limit resets. They are still live
+    # tasks, so every tool that looks a task up must look here too — a parked
+    # task that reads as "not found" looks, to a client, like a lost one.
+    "awaiting_credits": TASKS_DIR / "awaiting_credits",
+    "awaiting_weekly_reset": TASKS_DIR / "awaiting_weekly_reset",
 }
 
 
@@ -228,6 +234,18 @@ def user_can_access_project(username: str, project_name: str) -> bool:
     return username in project.get("allowed_users", [])
 
 
+def user_can_see_task(username: str, meta: dict) -> bool:
+    """A task is visible to whoever submitted it and to anyone allowed on its project.
+
+    task_status returns the full prompt and task_output the full run log — both
+    routinely carry credentials the submitter passed to the task — so knowing (or
+    guessing) a task id must not be enough to read them.
+    """
+    if meta.get("user") == username:
+        return True
+    return user_can_access_project(username, str(meta.get("project", "")))
+
+
 # ── Task helpers ──
 
 
@@ -247,6 +265,18 @@ def find_task_file(task_id: str) -> Optional[Path]:
         if path.exists():
             return path
     return None
+
+
+def queue_position(task_id: str) -> int:
+    """Where a queued task stands, oldest first: 1 = next to start. 0 = not queued."""
+    queued_dir = STATUS_DIRS["queued"]
+    if not queued_dir.exists():
+        return 0
+    names = sorted(p.name for p in queued_dir.glob("*.md"))
+    try:
+        return names.index(f"{task_id}.md") + 1
+    except ValueError:
+        return 0
 
 
 def list_task_files(status: str = "", limit: int = 20) -> list[Path]:
@@ -521,7 +551,7 @@ def task_status(task_id: str) -> str:
 
     Returns the task's metadata (status, timestamps, exit code) and the prompt.
     """
-    get_current_user()  # ensure authenticated
+    username = get_current_user()
 
     path = find_task_file(task_id)
     if not path:
@@ -529,6 +559,8 @@ def task_status(task_id: str) -> str:
 
     post = frontmatter.load(str(path))
     meta = post.metadata
+    if not user_can_see_task(username, meta):
+        return f"Task '{task_id}' not found."
 
     lines = [
         f"Task: {meta.get('id', task_id)}",
@@ -543,6 +575,12 @@ def task_status(task_id: str) -> str:
         lines.append(f"Completed: {meta['completed_at']}")
     if meta.get("exit_code") is not None:
         lines.append(f"Exit code: {meta['exit_code']}")
+    if meta.get("status") == "queued":
+        position = queue_position(task_id)
+        if position:
+            lines.append(f"Queue position: {position}")
+    if meta.get("credit_reset_at") and str(meta.get("status", "")).startswith("awaiting_"):
+        lines.append(f"Credit reset: {meta['credit_reset_at']}")
     lines.append(f"Timeout: {meta.get('max_timeout_minutes', 60)}m")
     lines.append(f"\n--- Prompt ---\n{post.content}")
 
@@ -554,13 +592,14 @@ def list_tasks(status: str = "", limit: int = 20) -> str:
     """List recent tasks, optionally filtered by status.
 
     Args:
-        status: Filter by status — 'queued', 'processing', 'done', 'failed'. Empty = all.
+        status: Filter by status — 'queued', 'processing', 'done', 'failed',
+            'awaiting_credits', 'awaiting_weekly_reset'. Empty = all.
         limit: Maximum number of tasks to return (default 20).
     """
-    get_current_user()
+    username = get_current_user()
 
     if status and status not in STATUS_DIRS:
-        return f"Invalid status '{status}'. Use: queued, processing, done, failed"
+        return f"Invalid status '{status}'. Use: {', '.join(STATUS_DIRS)}"
 
     files = list_task_files(status=status, limit=limit)
     if not files:
@@ -570,6 +609,8 @@ def list_tasks(status: str = "", limit: int = 20) -> str:
     for path in files:
         post = frontmatter.load(str(path))
         meta = post.metadata
+        if not user_can_see_task(username, meta):
+            continue
         line = f"[{meta.get('status', '?')}] {meta.get('id', path.stem)} — {meta.get('project', '?')}"
         if meta.get("user"):
             line += f" (by {meta['user']})"
@@ -580,27 +621,30 @@ def list_tasks(status: str = "", limit: int = 20) -> str:
         line += f"\n  {preview}"
         lines.append(line)
 
+    if not lines:
+        return "No tasks found" + (f" with status '{status}'" if status else "") + "."
     return "\n\n".join(lines)
 
 
 @mcp.tool()
 def cancel_task(task_id: str) -> str:
-    """Cancel a queued task. Only tasks that haven't started processing can be cancelled.
+    """Cancel a task that is not running: one still queued, or one parked for a
+    usage limit (which would otherwise run again by itself when the limit resets).
 
     Args:
         task_id: The task ID to cancel.
     """
-    get_current_user()
+    username = get_current_user()
 
-    # Only look in queued directory
-    queued_path = STATUS_DIRS["queued"] / f"{task_id}.md"
-    if not queued_path.exists():
-        # Check if it's in another state
-        path = find_task_file(task_id)
-        if path:
-            post = frontmatter.load(str(path))
-            return f"Cannot cancel — task is '{post.metadata.get('status', 'unknown')}'. Only queued tasks can be cancelled."
+    path = find_task_file(task_id)
+    if not path or not user_can_see_task(username, frontmatter.load(str(path)).metadata):
         return f"Task '{task_id}' not found."
+
+    cancellable = ("queued", "awaiting_credits", "awaiting_weekly_reset")
+    if path.parent not in [STATUS_DIRS[name] for name in cancellable]:
+        post = frontmatter.load(str(path))
+        return f"Cannot cancel — task is '{post.metadata.get('status', 'unknown')}'. Only queued or parked tasks can be cancelled."
+    queued_path = path
 
     # Move to failed with status cancelled
     post = frontmatter.load(str(queued_path))
@@ -622,17 +666,17 @@ def task_output(task_id: str) -> str:
     Args:
         task_id: The task ID to get output for.
     """
-    get_current_user()
+    username = get_current_user()
+
+    path = find_task_file(task_id)
+    if not path or not user_can_see_task(username, frontmatter.load(str(path)).metadata):
+        return f"Task '{task_id}' not found."
 
     log_path = LOGS_DIR / f"{task_id}.log"
     if not log_path.exists():
-        # Check if task exists at all
-        path = find_task_file(task_id)
-        if not path:
-            return f"Task '{task_id}' not found."
         post = frontmatter.load(str(path))
         status = post.metadata.get("status", "unknown")
-        if status in ("queued", "processing"):
+        if status in ("queued", "processing", "awaiting_credits", "awaiting_weekly_reset"):
             return f"Task is still '{status}' — output not yet available."
         # No log file means the task failed BEFORE the worker started — a
         # pre-flight rejection (disk limit, unmet requirements, bad project/user

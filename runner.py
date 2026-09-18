@@ -263,6 +263,64 @@ def claim_task(task_path: Path) -> Path | None:
         return None
 
 
+def task_session_id(task_path: Path) -> str:
+    """The Claude session a task continues, or "" if it names none."""
+    try:
+        return str(frontmatter.load(str(task_path)).metadata.get("claude_session_id") or "")
+    except Exception:
+        return ""
+
+
+def sessions_in_progress(exclude: Path | None = None) -> dict[str, str]:
+    """{claude_session_id: task filename} for every task now processing."""
+    busy: dict[str, str] = {}
+    if not PROCESSING_DIR.exists():
+        return busy
+    for path in PROCESSING_DIR.glob("*.md"):
+        if exclude is not None and path.name == exclude.name:
+            continue
+        session_id = task_session_id(path)
+        if session_id:
+            # keep the OLDEST task per session — it is the one with the right of way
+            if session_id not in busy or path.name < busy[session_id]:
+                busy[session_id] = path.name
+    return busy
+
+
+def claim_next_task(queued: list[Path]) -> Path | None:
+    """Claim the oldest queued task whose Claude session is not already running.
+
+    Two tasks on one session are two `claude --resume` processes writing the same
+    conversation and, usually, the same project data at once — turns of one
+    conversation must run one after another. A task whose session is busy is
+    left in the queue (it keeps its place) and the next eligible one is taken.
+
+    Runner processes start every half second and can each claim a different
+    task of the same idle session in the same instant, so the check is repeated
+    AFTER the claim: of two such tasks the older filename keeps the claim and
+    the younger goes back to the queue.
+    """
+    busy = sessions_in_progress()
+    for task_path in queued:
+        session_id = task_session_id(task_path)
+        if session_id and session_id in busy:
+            continue
+        claimed = claim_task(task_path)
+        if not claimed:
+            continue  # another runner claimed it
+        if session_id:
+            rival = sessions_in_progress(exclude=claimed).get(session_id)
+            if rival is not None and rival < claimed.name:
+                try:
+                    os.rename(claimed, QUEUED_DIR / claimed.name)
+                    log(f"Task {claimed.stem} waits: session {session_id[:8]} is running {rival[:-3]}.")
+                except OSError as e:
+                    log(f"Error re-queuing {claimed.name}: {e}")
+                continue
+        return claimed
+    return None
+
+
 def update_frontmatter(path: Path, **updates) -> frontmatter.Post:
     """Update frontmatter fields and write back. Returns the updated post."""
     post = frontmatter.load(str(path))
@@ -1172,13 +1230,9 @@ def main():
     if not queued:
         return  # Nothing to do — silent exit
 
-    for task_path in queued:
-        claimed = claim_task(task_path)
-        if claimed:
-            run_task(claimed, projects, users)
-            return  # One task per invocation
-
-    log("All queued tasks were claimed by other runners.")
+    claimed = claim_next_task(queued)
+    if claimed:
+        run_task(claimed, projects, users)  # One task per invocation
 
 
 if __name__ == "__main__":
