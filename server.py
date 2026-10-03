@@ -459,11 +459,16 @@ async def auth_page_post_route(request: Request):
 # ── Tools ──
 
 
+# Per-container limits on one task's run time (the platform sets both per account).
+DEFAULT_TIMEOUT_MINUTES = int(os.environ.get("DEFAULT_TIMEOUT_MINUTES", 120))
+MAX_TIMEOUT_MINUTES = int(os.environ.get("MAX_TIMEOUT_MINUTES", 120))
+
+
 @mcp.tool()
 def submit_task(
     project: str,
     prompt: str,
-    max_timeout_minutes: int = 120,
+    max_timeout_minutes: int = 0,
     claude_session_id: str = "",
     session_started: bool = False,
     attachments: list | None = None,
@@ -475,7 +480,8 @@ def submit_task(
     Args:
         project: Project name (from projects.yaml) — determines working directory.
         prompt: The prompt/instructions for Claude Code to execute.
-        max_timeout_minutes: Maximum execution time (default 120, max 180).
+        max_timeout_minutes: Maximum execution time in minutes. Omit for this
+            runner's default; values above this runner's maximum are capped.
         claude_session_id: Optional. Pin the Claude Code session to this id so a
             series of tasks form ONE continuous conversation. Omit for a fresh
             one-off session (the default).
@@ -498,7 +504,9 @@ def submit_task(
         return f"You don't have access to project '{project}'."
 
     # Validate timeout
-    max_timeout_minutes = max(1, min(max_timeout_minutes, 180))
+    if max_timeout_minutes <= 0:
+        max_timeout_minutes = DEFAULT_TIMEOUT_MINUTES
+    max_timeout_minutes = max(1, min(max_timeout_minutes, MAX_TIMEOUT_MINUTES))
 
     # Create task file
     task_id = generate_task_id()

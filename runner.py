@@ -900,7 +900,8 @@ def run_task(task_path: Path, projects: dict, users: dict):
     project_name = meta.get("project", "")
     username = meta.get("user", "")
     task_prompt = post.content.strip()
-    timeout_minutes = meta.get("max_timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
+    timeout_minutes = min(meta.get("max_timeout_minutes") or DEFAULT_TIMEOUT_MINUTES,
+                          MAX_TIMEOUT_MINUTES)
 
     # Session id: assigned at enqueue time, but lazy-assign as a safety net
     # for tasks created by external producers that didn't set one.
