@@ -221,6 +221,11 @@ projects:
     pull_before_task: true
 ```
 
+A project may also set `requirements_profile: <name>` so that only the
+requirements in its `agent-requirements.yaml` tagged for that profile apply —
+one repo checked out in two shapes. See
+[docs/requirements-profiles.md](docs/requirements-profiles.md).
+
 ### Environment Variables (.env)
 
 | Variable | Default | Description |
@@ -260,6 +265,13 @@ docker compose up -d --build
 ```
 
 ---
+
+## Notifications
+
+The runner can post to a webhook (Discord works out of the box) when the Claude
+account hits its usage limit and again when the hold lifts — detected by the
+runner itself, no model involved. Configure `config/notifications.yaml`; see
+[docs/notifications.md](docs/notifications.md).
 
 ## Security Model
 

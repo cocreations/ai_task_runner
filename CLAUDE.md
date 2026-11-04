@@ -52,3 +52,25 @@ Android SDK versions in the image target Godot 4.7's export (per the official
 4.7 Android export docs): SDK Platform 35, Build-Tools 35.0.1, Platform-Tools,
 cmdline-tools (latest). NDK/CMake are omitted (only needed for native/GDExtension
 builds); add them to the Dockerfile's SDK block if that changes.
+
+## Notifications and requirements profiles (2026-11-05)
+
+Two small, deliberate additions for the Moment "create your own moment" work:
+
+- **Webhook on a credit hold.** `finalize_awaiting` is the only place a task is
+  parked for a usage limit, so that is where `notify_credit_limit` posts to the
+  webhooks in `config/notifications.yaml` — once per hold, via the exclusive
+  marker `tasks/.credit_hold_notified`; `maybe_notify_restored` (each tick,
+  after the re-queue) posts the lift and removes the marker. `server.task_status`
+  adds `Credit hold: until … (kind)` to a *queued* task while a hold is active,
+  which is how a client (the Moment builder) learns its task is paused rather
+  than stuck. The hold lookup lives in `credit_hold.py` and takes directories as
+  arguments because the server's tests patch `STATUS_DIRS` while the runner has
+  its own `AWAITING_*_DIR` constants. Docs: `docs/notifications.md`.
+- **Requirements profiles.** `agent-requirements.yaml` entries may carry
+  `profiles: [...]`; `projects.yaml` may set `requirements_profile`. A project
+  with no profile sees every requirement (unchanged behaviour). Docs:
+  `docs/requirements-profiles.md`.
+
+New modules must be added to the Dockerfile's `COPY` line — files are copied by
+name, and an image without them starts a runner that cannot import.

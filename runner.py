@@ -27,7 +27,9 @@ from pathlib import Path
 import frontmatter
 import yaml
 
+import credit_hold
 import housekeeping
+import notify
 
 BASE_DIR = Path(__file__).parent
 CONFIG_DIR = BASE_DIR / "config"
@@ -185,11 +187,39 @@ def _requirement_failure(req: dict, problem: str) -> str:
     return "\n".join(lines)
 
 
-def check_requirements(project_name: str, project_dir: str, env: dict) -> list[str]:
+def requirement_applies(req: dict, profile: str | None) -> tuple[bool, str | None]:
+    """Does this requirement apply under the project's requirements profile?
+
+    A requirement with no `profiles` key always applies. One with
+    `profiles: [a, b]` applies only when the project's `requirements_profile`
+    (projects.yaml, set per project on the hosting platform) is one of them —
+    so one manifest can describe a repo that runs in more than one shape: the
+    moment-agents sales pipeline needs its admin credentials and MCP servers,
+    while the same repo checked out as the customer-facing sandbox must run
+    with none of them. A project with no profile set behaves as before: every
+    requirement applies. A malformed `profiles` value is reported as a failure
+    rather than skipped — silently ignoring it would make the requirement
+    vanish. Returns (applies, problem).
+    """
+    profiles = req.get("profiles")
+    if profiles is None:
+        return True, None
+    if not isinstance(profiles, list) or not profiles \
+            or not all(isinstance(p, str) and p.strip() for p in profiles):
+        return False, "invalid 'profiles' in manifest — must be a list of profile names"
+    if not profile:
+        return True, None
+    return profile in [p.strip() for p in profiles], None
+
+
+def check_requirements(project_name: str, project_dir: str, env: dict,
+                       profile: str | None = None) -> list[str]:
     """Verify the project's declared requirements before spending Claude time.
 
     Returns one human-readable failure string per unmet requirement (empty
-    list = all satisfied, or no manifest).
+    list = all satisfied, or no manifest). `profile` is the project's
+    requirements profile; requirements tagged for other profiles are skipped
+    (see requirement_applies).
     """
     reqs, error = load_requirements_manifest(project_dir)
     if error:
@@ -200,6 +230,12 @@ def check_requirements(project_name: str, project_dir: str, env: dict) -> list[s
 
     failures = []
     for req in reqs:
+        applies, problem = requirement_applies(req, profile)
+        if problem:
+            failures.append(_requirement_failure(req, problem))
+            continue
+        if not applies:
+            continue
         kind = req.get("kind")
         if kind == "mcp_server":
             if mcp_servers is None:
@@ -484,9 +520,46 @@ def finalize_awaiting(task_path: Path, kind: str, reset_at: datetime,
     }
     if exit_code is not None:
         updates["exit_code"] = exit_code
-    update_frontmatter(task_path, **updates)
+    post = update_frontmatter(task_path, **updates)
     os.rename(task_path, dest)
     log(f"Task {task_path.stem} hit {kind} limit → {status}, retry at {reset_at.isoformat()}")
+    notify_credit_limit(kind, reset_at, project=str(post.metadata.get("project") or ""),
+                        task_id=task_path.stem)
+
+
+def notify_credit_limit(kind: str, reset_at: datetime, project: str = "", task_id: str = ""):
+    """Tell the webhooks about a new credit hold — once. Up to MAX_CONCURRENT
+    tasks can park on the same limit within seconds of each other, each in its
+    own runner process; the exclusive marker file lets the first one speak and
+    keeps the rest quiet. Never raises: a notification is never the reason a
+    task fails."""
+    try:
+        if not credit_hold.claim_marker(TASKS_DIR, reset_at, kind):
+            return
+        hold = credit_hold.earliest_pending((AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR))
+        notify.send("credit_limit", limit_kind=kind, reset_at=reset_at.isoformat(),
+                    parked_tasks=hold.parked if hold else 1, project=project, task_id=task_id)
+    except Exception as e:  # noqa: BLE001
+        log(f"credit-limit notification failed (continuing): {e}")
+
+
+def maybe_notify_restored():
+    """When a hold the webhooks were told about is over — its reset passed and
+    the tasks went back to the queue, the token changed, or the parked tasks
+    were cancelled — say so once and forget the hold. Runs every tick; the
+    marker's removal is what makes it once (the process that removes it sends)."""
+    try:
+        marker = credit_hold.read_marker(TASKS_DIR)
+        if marker is None:
+            return
+        if credit_hold.earliest_pending((AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR)) is not None:
+            return
+        if not credit_hold.clear_marker(TASKS_DIR):
+            return
+        notify.send("credit_restored", limit_kind=str(marker.get("kind") or ""),
+                    reset_at=str(marker.get("reset_at") or ""))
+    except Exception as e:  # noqa: BLE001
+        log(f"credit-restored notification failed (continuing): {e}")
 
 
 def _requeue_awaiting_file(task_file: Path, reason: str, fresh_session: bool = False):
@@ -629,27 +702,8 @@ def earliest_pending_credit_hold() -> datetime | None:
     """Return the earliest future credit_reset_at across all parked tasks,
     or None if no task is currently in a credit hold. Call after
     requeue_ready_awaiting_tasks() — anything still parked has a future reset."""
-    now = datetime.now(timezone.utc)
-    earliest: datetime | None = None
-    for awaiting_dir in (AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR):
-        if not awaiting_dir.exists():
-            continue
-        for task_file in awaiting_dir.glob("*.md"):
-            try:
-                post = frontmatter.load(str(task_file))
-                reset_raw = post.metadata.get("credit_reset_at")
-                if not reset_raw:
-                    continue
-                reset_dt = datetime.fromisoformat(reset_raw)
-                if reset_dt.tzinfo is None:
-                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
-                if reset_dt <= now:
-                    continue
-                if earliest is None or reset_dt < earliest:
-                    earliest = reset_dt
-            except Exception:
-                continue
-    return earliest
+    hold = credit_hold.earliest_pending((AWAITING_CREDITS_DIR, AWAITING_WEEKLY_RESET_DIR))
+    return hold.reset_at if hold else None
 
 
 def looks_like_resume_failure(log_path: Path) -> bool:
@@ -996,7 +1050,8 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # which tells anyone what to fix.
     effective_env = {**os.environ,
                      **{k: str(v) for k, v in project.get("env", {}).items()}}
-    req_failures = check_requirements(project_name, project_dir, effective_env)
+    profile = str(project.get("requirements_profile") or "").strip() or None
+    req_failures = check_requirements(project_name, project_dir, effective_env, profile)
     if req_failures:
         log(f"Task {task_id}: {len(req_failures)} unmet requirement(s) — failing fast")
         finalize_task(task_path, "failed", exit_code=1, result_summary=(
@@ -1189,6 +1244,9 @@ def main():
 
     # Re-queue any credit-held tasks whose reset time has passed
     requeue_ready_awaiting_tasks()
+
+    # If the webhooks were told about a hold that is now over, tell them that too.
+    maybe_notify_restored()
 
     # Reap any stale tasks before checking capacity
     reap_stale_tasks()

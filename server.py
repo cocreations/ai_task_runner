@@ -31,6 +31,8 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 
+import credit_hold
+
 # ── Configuration ──
 
 BASE_DIR = Path(__file__).parent
@@ -587,6 +589,13 @@ def task_status(task_id: str) -> str:
         position = queue_position(task_id)
         if position:
             lines.append(f"Queue position: {position}")
+        # A queued task behind a credit hold is not moving, and nothing in its
+        # own metadata says so — the hold belongs to the parked tasks. Say it
+        # here so a client can show "paused until …" instead of a stuck queue.
+        hold = credit_hold.earliest_pending((STATUS_DIRS["awaiting_credits"],
+                                             STATUS_DIRS["awaiting_weekly_reset"]))
+        if hold:
+            lines.append(f"Credit hold: until {hold.reset_at.isoformat()} ({hold.kind})")
     if meta.get("credit_reset_at") and str(meta.get("status", "")).startswith("awaiting_"):
         lines.append(f"Credit reset: {meta['credit_reset_at']}")
     lines.append(f"Timeout: {meta.get('max_timeout_minutes', 60)}m")
