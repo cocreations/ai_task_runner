@@ -93,14 +93,15 @@ RUN pip install --no-cache-dir playwright Pillow \
 
 # ---------------------------------------------------------------------------
 # moment-agents pipeline Python deps: Firestore state (firebase-admin), HTTP
-# fetches (requests), and the pre-send MX/deliverability check (dnspython).
+# fetches (requests), the HTML parser its generated extractors import
+# (beautifulsoup4), and the pre-send MX/deliverability check (dnspython).
 # Installed system-wide so every container user (root and taskrunner) can
 # import them with no runtime `pip install`. These were previously pip-installed
 # into ~/.local at task runtime, which a container recreate would silently wipe;
 # baking them in makes a fresh container self-sufficient. Versions track
 # moment-agents/requirements.txt.
 # ---------------------------------------------------------------------------
-RUN pip install --no-cache-dir "firebase-admin>=6.0.0" "requests>=2.28.0" "dnspython>=2.4.0"
+RUN pip install --no-cache-dir "firebase-admin>=6.0.0" "requests>=2.28.0" "dnspython>=2.4.0" "beautifulsoup4>=4.12.0"
 
 # Copy application code
 COPY server.py runner.py housekeeping.py enqueue.py task_wait.py credit_hold.py notify.py entrypoint.sh ./
