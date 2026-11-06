@@ -481,7 +481,11 @@ def submit_task(
 
     Args:
         project: Project name (from projects.yaml) — determines working directory.
-        prompt: The prompt/instructions for Claude Code to execute.
+        prompt: The prompt/instructions for Claude Code to execute. To choose
+            the model, put `/model <id>;` on a line of its own within the first
+            ten lines (e.g. `/model claude-opus-5-5;` or `/model sonnet;`); the
+            runner removes the line and passes the id to Claude Code. Without
+            it the task runs on the account's default model.
         max_timeout_minutes: Maximum execution time in minutes. Omit for this
             runner's default; values above this runner's maximum are capped.
         claude_session_id: Optional. Pin the Claude Code session to this id so a
@@ -585,6 +589,10 @@ def task_status(task_id: str) -> str:
         lines.append(f"Completed: {meta['completed_at']}")
     if meta.get("exit_code") is not None:
         lines.append(f"Exit code: {meta['exit_code']}")
+    # The model the runner passed to the CLI (the task's `/model` line or the
+    # account default); absent when the CLI chose its own default.
+    if meta.get("model"):
+        lines.append(f"Model: {meta['model']}")
     if meta.get("status") == "queued":
         position = queue_position(task_id)
         if position:

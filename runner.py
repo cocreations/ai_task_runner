@@ -676,15 +676,53 @@ def clear_credit_hold_on_token_change():
         log(f"Could not persist Claude auth fingerprint: {e}")
 
 
-MODEL_DIRECTIVE_RE = re.compile(r"^\s*/model\s+\S+", re.MULTILINE)
+# Which model a task runs on.
+#
+# A task names its model with a line `/model <id>;` in the first ten lines of
+# its prompt, and an account can set a default (config/.default_model, written
+# by the platform's Setup page). Headless `claude -p` does not run slash
+# commands: the prompt is only words to it, and ours begins with the runner's
+# own context anyway. So until 2026-11-06 both were silently ignored and every
+# task ran on the CLI's default model, whatever it asked for. The runner now
+# takes the line out of the prompt and passes the id to the CLI as `--model`,
+# which is the only thing headless Claude Code honours.
+MODEL_DIRECTIVE_RE = re.compile(r"^[ \t]*/model[ \t]+(\S+?)[ \t]*;?[ \t]*$")
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}$")
+MODEL_DIRECTIVE_LINES = 10
+
+
+def valid_model_id(value) -> str | None:
+    """The id if it is something we will hand to `--model` (a model id or an
+    alias such as `opus`), else None. It becomes one argv element, so the only
+    thing to keep out is a value the CLI could read as a flag."""
+    value = str(value or "").strip()
+    return value if MODEL_ID_RE.match(value) else None
+
+
+def split_model_directive(task_prompt: str) -> tuple[str | None, str]:
+    """(model id or None, the prompt without its `/model <id>;` line).
+
+    The directive is a line of its own within the first ten lines. The line and
+    one blank line after it are removed, so the model never sees it. A line
+    that names no usable id is left where it is and is not a directive."""
+    lines = task_prompt.splitlines()
+    for i, line in enumerate(lines[:MODEL_DIRECTIVE_LINES]):
+        m = MODEL_DIRECTIVE_RE.match(line)
+        if not m:
+            continue
+        model = valid_model_id(m.group(1))
+        if not model:
+            return None, task_prompt
+        rest = lines[:i] + lines[i + 1:]
+        if i < len(rest) and not rest[i].strip():
+            del rest[i]
+        return model, "\n".join(rest).strip("\n")
+    return None, task_prompt
 
 
 def has_model_override(task_prompt: str) -> bool:
-    """True if the task prompt's first ~10 lines contain a /model slash command.
-    Matches the line-anchored pattern Claude CLI uses for slash commands, so
-    detection == what Claude actually treats as a directive."""
-    head = "\n".join(task_prompt.splitlines()[:10])
-    return MODEL_DIRECTIVE_RE.search(head) is not None
+    """True if the task prompt names its own model (see split_model_directive)."""
+    return split_model_directive(task_prompt)[0] is not None
 
 
 def read_default_model() -> str | None:
@@ -693,9 +731,36 @@ def read_default_model() -> str | None:
     if not path.exists():
         return None
     try:
-        return path.read_text().strip() or None
+        return valid_model_id(path.read_text())
     except Exception:
         return None
+
+
+def resolve_model(task_prompt: str) -> tuple[str | None, str]:
+    """(model to run on or None, the prompt to send). The task's own `/model`
+    line wins; otherwise the account's default; otherwise None, and the CLI
+    picks its default model."""
+    model, prompt = split_model_directive(task_prompt)
+    return (model or read_default_model()), prompt
+
+
+def claude_command(session_flag: str, session_id: str, prompt: str,
+                   model: str | None = None,
+                   mcp_config_path: Path | None = None) -> list[str]:
+    """The headless Claude Code command for one task run."""
+    cmd = ["claude", session_flag, session_id, "-p", prompt,
+           "--output-format", "stream-json", "--verbose",
+           "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    # Per-project MCP servers: the hosting platform materializes a claude-format
+    # MCP config at /secrets/mcp/<project>.mcp.json (bind-mounted, so it
+    # survives container recreates). --strict-mcp-config makes that file the
+    # ONLY MCP source, so stray per-user state inside the container (e.g. a
+    # hand-edited ~/.claude.json) can never affect tasks.
+    if mcp_config_path is not None and mcp_config_path.is_file():
+        cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
+    return cmd
 
 
 def earliest_pending_credit_hold() -> datetime | None:
@@ -1069,13 +1134,12 @@ def run_task(task_path: Path, projects: dict, users: dict):
     )
     skills_context = load_skills(project_dir)
 
-    # Apply the user's default-model preference to the task prompt unless the
-    # task already specifies its own /model directive. Injecting into
-    # task_prompt (not the assembled prompt) keeps the convention identical
-    # to a user-written /model line at the top of their task.
-    default_model = read_default_model()
-    if default_model and not has_model_override(task_prompt):
-        task_prompt = f"/model {default_model};\n\n" + task_prompt
+    # The model: the task's own `/model <id>;` line, else the account's default,
+    # else the CLI's. The line is taken out of the prompt here and the id goes
+    # to the CLI as --model below (see split_model_directive for why).
+    model, task_prompt = resolve_model(task_prompt)
+    if model:
+        log(f"Task {task_id}: model={model}")
 
     # Download any attachments locally and describe them in the prompt (cleaned
     # up in the finally below). No-op when the task has none.
@@ -1085,7 +1149,10 @@ def run_task(task_path: Path, projects: dict, users: dict):
 
     # Mark as processing
     now = datetime.now(timezone.utc).isoformat()
-    update_frontmatter(task_path, status="processing", started_at=now)
+    started = {"status": "processing", "started_at": now}
+    if model:
+        started["model"] = model
+    update_frontmatter(task_path, **started)
 
     # Build environment — run claude as non-root taskrunner user
     env = os.environ.copy()
@@ -1111,18 +1178,8 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # the session UUID; on subsequent runs (after a credit-hold re-queue) we
     # use --resume to pick up where we left off.
     session_flag = "--resume" if session_started else "--session-id"
-    claude_cmd = ["claude", session_flag, claude_session_id, "-p", prompt,
-                  "--output-format", "stream-json", "--verbose",
-                  "--dangerously-skip-permissions"]
-
-    # Per-project MCP servers: the hosting platform materializes a claude-format
-    # MCP config at /secrets/mcp/<project>.mcp.json (bind-mounted, so it
-    # survives container recreates). --strict-mcp-config makes that file the
-    # ONLY MCP source, so stray per-user state inside the container (e.g. a
-    # hand-edited ~/.claude.json) can never affect tasks.
-    mcp_config_path = MCP_CONFIG_DIR / f"{project_name}.mcp.json"
-    if mcp_config_path.is_file():
-        claude_cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
+    claude_cmd = claude_command(session_flag, claude_session_id, prompt, model,
+                                MCP_CONFIG_DIR / f"{project_name}.mcp.json")
 
     # Launch Claude Code. Log file is line-buffered so each NDJSON event
     # flushes to disk immediately — the platform's web dashboard tails this

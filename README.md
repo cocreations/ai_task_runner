@@ -266,6 +266,12 @@ docker compose up -d --build
 
 ---
 
+## Choosing the model
+
+A task runs on the model named by a `/model <id>;` line in the first ten lines
+of its prompt, else on the account's default (`config/.default_model`), else on
+Claude Code's own default. See [docs/model.md](docs/model.md).
+
 ## Notifications
 
 The runner can post to a webhook (Discord works out of the box) when the Claude
