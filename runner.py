@@ -942,6 +942,9 @@ def refresh_git_credentials():
         if (GIT_CREDENTIALS_FILE.exists()
                 and GIT_CREDENTIALS_FILE.read_text() == line):
             return
+        # The home is a root-owned sticky dir; fs.protected_regular refuses even
+        # root an O_CREAT open of taskrunner's existing file there — unlink first.
+        GIT_CREDENTIALS_FILE.unlink(missing_ok=True)
         GIT_CREDENTIALS_FILE.write_text(line)
         os.chmod(GIT_CREDENTIALS_FILE, 0o600)
         shutil.chown(GIT_CREDENTIALS_FILE, "taskrunner", "taskrunner")

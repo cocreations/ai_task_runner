@@ -20,6 +20,10 @@ if [ -f /secrets/github_token ]; then
     GH_TOKEN="$(cat /secrets/github_token)"
 fi
 if [ -n "$GH_TOKEN" ]; then
+    # The home is a root-owned sticky directory (below) and the kernel's
+    # fs.protected_regular refuses even root an O_CREAT open of a file another
+    # user owns there — so remove the old file before writing the new one.
+    rm -f /home/taskrunner/.git-credentials
     printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /home/taskrunner/.git-credentials
     chown taskrunner:taskrunner /home/taskrunner/.git-credentials
     chmod 600 /home/taskrunner/.git-credentials
