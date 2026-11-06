@@ -747,6 +747,10 @@ def resolve_model(task_prompt: str) -> tuple[str | None, str]:
     return (model or read_default_model()), prompt
 
 
+# An MCP config with no servers, passed inline (Claude Code takes JSON strings).
+NO_MCP_SERVERS = '{"mcpServers":{}}'
+
+
 def claude_command(session_flag: str, session_id: str, prompt: str,
                    model: str | None = None,
                    mcp_config_path: Path | None = None) -> list[str]:
@@ -759,10 +763,15 @@ def claude_command(session_flag: str, session_id: str, prompt: str,
     # Per-project MCP servers: the hosting platform materializes a claude-format
     # MCP config at /secrets/mcp/<project>.mcp.json (bind-mounted, so it
     # survives container recreates). --strict-mcp-config makes that file the
-    # ONLY MCP source, so stray per-user state inside the container (e.g. a
-    # hand-edited ~/.claude.json) can never affect tasks.
+    # ONLY MCP source. It is passed on EVERY run — with an empty server list when
+    # the project has no file — because without it Claude Code also loads servers
+    # from the checkout's .mcp.json and from ~/.claude.json, both writable by a
+    # task: a hijacked task could plant a "server" (any command) that would start
+    # with every later task (docs/isolation.md).
     if mcp_config_path is not None and mcp_config_path.is_file():
         cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
+    else:
+        cmd += ["--mcp-config", NO_MCP_SERVERS, "--strict-mcp-config"]
     return cmd
 
 
@@ -990,7 +999,55 @@ def checkout_lock(project_dir: str):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def pull_project(project_dir: str) -> tuple[bool, str]:
+# Files Claude Code reads from a checkout that git may ignore, so `git clean`
+# would leave them: a task could plant instructions, hooks or MCP servers for
+# every later task in the same checkout. Deleted before each task of a
+# `reset_before_task` project (tracked copies come back with the reset).
+LOCAL_OVERRIDE_FILES = ("CLAUDE.local.md", ".claude/settings.local.json", ".mcp.json")
+
+# Untracked directories a RUNNING task needs that `git clean` must leave alone.
+# Everything else a task keeps between steps belongs in a git-ignored directory.
+CLEAN_KEEP = (".ai-attachments",)
+
+
+def reset_checkout(git, project_dir: str) -> tuple[bool, str, list[str]]:
+    """Put a checkout back to exactly what git has: delete the local override
+    files, restore tracked files, remove untracked files (ignored ones stay —
+    that is where a running task's scratch lives). Returns (ok, error, notes)
+    where notes say what was undone, for the task's log."""
+    deleted = []
+    for rel in LOCAL_OVERRIDE_FILES:
+        path = Path(project_dir) / rel
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            deleted.append(rel)
+    status = git(["status", "--porcelain", "--untracked-files=all"], 60)
+    if status.returncode != 0:
+        return False, f"git status failed: {status.stderr.strip()}", []
+    entries = [line for line in status.stdout.splitlines() if len(line) > 3]
+    modified = [line[3:].strip() for line in entries if not line.startswith("??")]
+    untracked = [line[3:].strip() for line in entries if line.startswith("??")
+                 and not line[3:].strip().startswith(CLEAN_KEEP)]
+    reset = git(["reset", "--hard", "--quiet"], 120)
+    if reset.returncode != 0:
+        return False, f"git reset --hard failed: {reset.stderr.strip()}", []
+    clean = git(["clean", "-fd", "--quiet", *[a for k in CLEAN_KEEP for a in ("-e", k)]], 120)
+    if clean.returncode != 0:
+        return False, f"git clean failed: {clean.stderr.strip()}", []
+
+    def some(items):
+        return ", ".join(items[:10]) + (" …" if len(items) > 10 else "")
+    notes = []
+    if modified:
+        notes.append("restored " + some(modified))
+    if untracked:
+        notes.append("removed " + some(untracked))
+    if deleted:
+        notes.append("deleted " + some(deleted))
+    return True, "", notes
+
+
+def pull_project(project_dir: str, reset: bool = False) -> tuple[bool, str]:
     """Fast-forward a git project's checkout before a task runs (projects.yaml
     `pull_before_task: true`, set per project on the platform's Projects page).
 
@@ -1003,6 +1060,11 @@ def pull_project(project_dir: str) -> tuple[bool, str]:
     stale — when the tree has uncommitted changes to tracked files (a pull
     would lose them), when the branch has diverged (no fast-forward), or when
     the fetch fails. Runs as taskrunner (the checkout's owner) when root.
+
+    `reset` (projects.yaml `reset_before_task: true`, for a project whose tasks
+    act on untrusted input): instead of refusing a changed tree, put it back to
+    what git has first — see reset_checkout — so nothing one task leaves in the
+    checkout reaches the next. The message says what was undone.
     """
     if not os.path.isdir(os.path.join(project_dir, ".git")):
         return False, "The project directory is not a git repository."
@@ -1017,6 +1079,11 @@ def pull_project(project_dir: str) -> tuple[bool, str]:
 
     try:
         with checkout_lock(project_dir):
+            notes = []
+            if reset:
+                ok, error, notes = reset_checkout(git, project_dir)
+                if not ok:
+                    return False, error
             status = git(["status", "--porcelain", "--untracked-files=no"], 60)
             if status.returncode != 0:
                 return False, f"git status failed: {status.stderr.strip()}"
@@ -1031,11 +1098,45 @@ def pull_project(project_dir: str) -> tuple[bool, str]:
                 lines = [l for l in (pull.stderr + "\n" + pull.stdout).splitlines() if l.strip()]
                 return False, f"git pull --ff-only failed: {lines[-1].strip() if lines else 'no output'}"
             head = git(["log", "-1", "--format=%h %s"], 30)
-            return True, f"now at {head.stdout.strip()}"
+            message = f"now at {head.stdout.strip()}"
+            if notes:
+                message += "; the checkout was reset first (" + "; ".join(notes) + ")"
+            return True, message
     except subprocess.TimeoutExpired as e:
         return False, f"git timed out: {e}"
     except Exception as e:  # noqa: BLE001 — the message is the task's failure reason
         return False, f"pull failed: {e}"
+
+
+def lock_public_dir(project_dir: str):
+    """A `reset_before_task` project cannot publish files: its public folder
+    (`<projects>/.public/<name>`, which the platform serves at a public URL and
+    the entrypoint hands to taskrunner at every start) is made root-owned and
+    read-only before each task. Otherwise a hijacked task could host any page
+    it liked under the account's own domain. Root only; no-op elsewhere."""
+    if os.geteuid() != 0:
+        return
+    public = Path(project_dir).parent / ".public" / Path(project_dir).name
+    if not public.is_dir():
+        return
+    try:
+        subprocess.run(["chown", "-R", "root:root", str(public)], capture_output=True, timeout=120)
+        subprocess.run(["chmod", "-R", "go-w", str(public)], capture_output=True, timeout=120)
+    except Exception as e:  # noqa: BLE001 — best-effort, logged
+        log(f"could not lock the public folder of {project_dir} (continuing): {e}")
+
+
+def current_github_token() -> str | None:
+    """The GitHub token as it is NOW (/secrets/github_token, which the platform
+    rewrites when the user saves a new one). The container's GH_TOKEN env var is
+    frozen at creation, so after a token change it still holds the OLD one — and
+    every task could read it. The task's environment gets this value instead."""
+    try:
+        if GH_TOKEN_FILE.is_file():
+            return GH_TOKEN_FILE.read_text().strip() or None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def run_task(task_path: Path, projects: dict, users: dict):
@@ -1100,8 +1201,11 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # Pull before the task (projects.yaml `pull_before_task`): the runner does it, not
     # the model, and a task never runs on a checkout it could not bring up to date.
     checkout_note = ""
-    if project.get("pull_before_task"):
-        ok, msg = pull_project(project_dir)
+    reset = bool(project.get("reset_before_task"))
+    if reset:
+        lock_public_dir(project_dir)
+    if project.get("pull_before_task") or reset:
+        ok, msg = pull_project(project_dir, reset=reset)
         log(f"Task {task_id}: pull before task — {msg}")
         if not ok:
             finalize_task(task_path, "failed", exit_code=1, result_summary=(
@@ -1195,6 +1299,9 @@ def run_task(task_path: Path, projects: dict, users: dict):
     # moment-agents stamping `owner` on prospects) read CLAUDE_USER.
     if username:
         env["CLAUDE_USER"] = username
+    token = current_github_token()
+    if token:
+        env["GH_TOKEN"] = token
     for key, value in project.get("env", {}).items():
         env[key] = str(value)
 

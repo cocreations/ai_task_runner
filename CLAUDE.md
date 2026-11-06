@@ -89,3 +89,18 @@ name, and an image without them starts a runner that cannot import.
   failed without running. `pull_project` holds `checkout_lock` (an flock on a
   file in the temp dir, keyed by the checkout's path) for the pull. Anything
   else the runner ever does to a checkout before a task belongs inside that lock.
+
+## Nothing a task leaves behind reaches the next task (2026-11-07)
+
+Tasks on one project share a user, a home and a checkout, and a project can be
+fed untrusted input (a customer's website). Until this date a steered task could
+plant `~/.claude/settings.json` hooks, `~/.bashrc`, a git credential helper, a
+`CLAUDE.local.md` or an MCP server that every later task — someone else's —
+would run. Now: the entrypoint makes every instruction file in the home
+root-owned (sticky home, so `taskrunner` can still create its own files);
+`claude_command` always passes `--strict-mcp-config`; a project with
+`reset_before_task: true` gets `reset_checkout` before its pull and a read-only
+public folder; the task env carries the *current* GitHub token, not the one
+frozen at container creation. `docs/isolation.md` is the full list, including
+what is **not** isolated (concurrent tasks, finished task files, the
+container's own secrets). Keep that page honest when you change any of this.

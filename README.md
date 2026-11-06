@@ -219,6 +219,11 @@ projects:
     # runner refuses to start a task it could not bring up to date — uncommitted
     # changes, a diverged branch — so no task ever runs on stale code.
     pull_before_task: true
+    # Optional, for a project whose tasks act on untrusted input: put the
+    # checkout back to exactly what git has before every task (tracked files
+    # restored, untracked removed, local Claude overrides deleted) and make
+    # its public folder read-only. Implies a pull. See docs/isolation.md.
+    reset_before_task: true
 ```
 
 A project may also set `requirements_profile: <name>` so that only the
@@ -287,6 +292,7 @@ runner itself, no model involved. Configure `config/notifications.yaml`; see
 4. **Secrets** — Claude credentials and config files have `600` permissions on server. Never stored in task files.
 5. **Audit trail** — every task file preserved. Every execution logged. Nothing auto-deleted.
 6. **Config lives on your laptop** — sensitive files are generated locally by the wizard and pushed via SSH. Re-run `./setup.sh` to update.
+7. **Nothing a task does reaches the next task** — the files Claude Code and bash read for instructions in the task user's home are root-owned; MCP servers come only from the platform's file; a `reset_before_task` project runs every task on a checkout put back to what git has. What is and is not isolated: [docs/isolation.md](docs/isolation.md).
 
 ---
 

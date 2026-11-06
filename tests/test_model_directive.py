@@ -120,7 +120,8 @@ class ClaudeCommand(unittest.TestCase):
     def test_mcp_config_only_when_the_file_exists(self):
         with tempfile.TemporaryDirectory() as d:
             missing = Path(d) / "p.mcp.json"
-            self.assertNotIn("--mcp-config", runner.claude_command("--session-id", "s", "p", "opus", missing))
+            self.assertEqual(runner.claude_command("--session-id", "s", "p", "opus", missing)[-3:],
+                             ["--mcp-config", runner.NO_MCP_SERVERS, "--strict-mcp-config"])
             missing.write_text("{}")
             cmd = runner.claude_command("--session-id", "s", "p", "opus", missing)
             self.assertEqual(cmd[-3:], ["--mcp-config", str(missing), "--strict-mcp-config"])
