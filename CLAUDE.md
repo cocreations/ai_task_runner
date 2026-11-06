@@ -74,3 +74,18 @@ Two small, deliberate additions for the Moment "create your own moment" work:
 
 New modules must be added to the Dockerfile's `COPY` line — files are copied by
 name, and an image without them starts a runner that cannot import.
+
+## The model, and one pull at a time (2026-11-06)
+
+- **`--model`.** A task's `/model <id>;` line (first ten lines) and the account's
+  `config/.default_model` were both dead until this date: headless `claude -p`
+  ignores a slash command inside a prompt, so every task ran on the CLI default.
+  `resolve_model` now takes the line out of the prompt and `claude_command`
+  passes the id as `--model`; the task records it (`model` in the front matter,
+  `Model:` in `task_status`). Do not go back to writing the directive into the
+  prompt. Docs: `docs/model.md`.
+- **Pull lock.** Each task is its own `runner.py` process; two that pulled the
+  same checkout in the same second collided on git's lock files and the loser
+  failed without running. `pull_project` holds `checkout_lock` (an flock on a
+  file in the temp dir, keyed by the checkout's path) for the pull. Anything
+  else the runner ever does to a checkout before a task belongs inside that lock.
